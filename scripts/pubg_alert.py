@@ -850,12 +850,23 @@ def parse_schedule(lines: list[str]) -> list[dict]:
         lines,
         r"^(Schedule|일정)$",
         (
-            r"^(Normal Match|일반전)$",
+            r"^(Normal Match|일반전|일반 매치)$",
             r"^일반 매치$",
         )
     )
 
     result = []
+
+    date_patterns = (
+        # 2026.06.17 / 2026-06-17 / 2026/6/17
+        r"20\d{2}[.\-/]\d{1,2}[.\-/]\d{1,2}",
+        # 26/6/17 / 26.6.17 / 26-6-17
+        r"\d{2}[.\-/]\d{1,2}[.\-/]\d{1,2}",
+        # June 17
+        r"[A-Za-z]+\s+\d{1,2}",
+        # 6월 17일
+        r"\d{1,2}\s*월\s*\d{1,2}\s*일",
+    )
 
     for i, line in enumerate(block):
         m = re.fullmatch(r"(?:Week|주차)\s*(\d+)|(\d+)\s*주차", line, re.I)
@@ -865,22 +876,30 @@ def parse_schedule(lines: list[str]) -> list[dict]:
         week = int(m.group(1) or m.group(2))
         pc_date = ""
 
-        for j in range(i + 1, min(i + 8, len(block))):
-            t = block[j]
+        # 현재 공식 페이지 구조:
+        # 1주차
+        # 26/6/17
+        # 26/6/25
+        # 2주차
+        # 26/6/24
+        for j in range(i + 1, min(i + 10, len(block))):
+            t = clean_text(block[j])
 
-            # June 17
-            if re.fullmatch(r"[A-Za-z]+\s+\d{1,2}", t):
-                pc_date = t
+            if not t:
+                continue
+
+            # 다음 주차가 나오면 중단
+            if re.fullmatch(r"(?:Week|주차)\s*\d+|\d+\s*주차", t, re.I):
                 break
 
-            # 6월 17일
-            if re.fullmatch(r"\d{1,2}\s*월\s*\d{1,2}\s*일", t):
+            if any(re.fullmatch(p, t, re.I) for p in date_patterns):
                 pc_date = t
                 break
 
         if pc_date:
             result.append({"week": week, "pc_date": pc_date})
 
+    print(f"[INFO] parsed map schedule={result}")
     return result
 
 
@@ -965,6 +984,27 @@ def parse_ranked_maps(lines: list[str]) -> list[str]:
 
 def parse_month_day(s: str, year: int) -> datetime:
     s = clean_text(s)
+
+    # 2026.06.17 / 2026-06-17 / 2026/6/17
+    m = re.fullmatch(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", s)
+    if m:
+        y = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+        return datetime(y, month, day, tzinfo=KST)
+
+    # 26/6/17 / 26.6.17 / 26-6-17
+    m = re.fullmatch(r"(\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", s)
+    if m:
+        y = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+
+        # PUBG 공식 맵 서비스 리포트의 26/6/17 형식 대응
+        if y < 100:
+            y = 2000 + y
+
+        return datetime(y, month, day, tzinfo=KST)
 
     # June 17
     try:
