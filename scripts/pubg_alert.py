@@ -1126,6 +1126,134 @@ def env_csv(name: str, default: list[str]) -> list[str]:
     ]
 
 
+def _mask_webhook_for_log(url: str) -> str:
+    url = str(url or "").strip()
+    if not url:
+        return "NO"
+
+    if not url.startswith("http"):
+        return "INVALID"
+
+    return "YES"
+
+
+def _normalize_guild_cfg_for_alert(cfg: dict) -> dict:
+    """
+    PUBG_ALERT_CONFIG_JSON 안의 guild 설정을 알림 스크립트가 쓰는 형태로 정규화한다.
+
+    지원 구조:
+    1) 정상 Actions용 구조:
+       {
+         "enabled": true,
+         "webhook_url": "...",
+         "types": {...}
+       }
+
+    2) 로컬 guild_data 구조가 실수로 들어간 경우:
+       {
+         "pubg_alert": {
+           "enabled": true,
+           "webhook_url": "...",
+           "types": {...}
+         }
+       }
+    """
+    if not isinstance(cfg, dict):
+        return {}
+
+    pa = cfg.get("pubg_alert")
+    if not isinstance(pa, dict):
+        pa = {}
+
+    webhook_url = str(cfg.get("webhook_url") or pa.get("webhook_url") or "").strip()
+
+    types = cfg.get("types")
+    if not isinstance(types, dict):
+        types = pa.get("types")
+    if not isinstance(types, dict):
+        types = {}
+
+    enabled = cfg.get("enabled")
+    if enabled is None:
+        enabled = pa.get("enabled")
+
+    channel_id = cfg.get("channel_id")
+    if channel_id is None:
+        channel_id = pa.get("channel_id")
+
+    channel_name = cfg.get("channel_name")
+    if not channel_name:
+        channel_name = pa.get("channel_name")
+
+    normalized = dict(cfg)
+
+    normalized["enabled"] = bool(enabled)
+    normalized["webhook_url"] = webhook_url
+    normalized["channel_id"] = channel_id
+    normalized["channel_name"] = str(channel_name or "")
+    normalized["types"] = {
+        "map_rotation": bool(types.get("map_rotation")),
+        "notice": bool(types.get("notice")),
+        "event": bool(types.get("event")),
+        "patch_notes": bool(types.get("patch_notes", types.get("notice"))),
+        "labs": bool(types.get("labs", types.get("notice"))),
+        "dev_notes": bool(types.get("dev_notes", types.get("notice"))),
+    }
+
+    normalized["platform"] = normalized.get("platform") or pa.get("platform") or "steam"
+    normalized["device"] = normalized.get("device") or pa.get("device") or "pc"
+    normalized["server_region"] = normalized.get("server_region") or pa.get("server_region") or "as"
+
+    normalized["normal_maps"] = (
+        normalized.get("normal_maps")
+        or pa.get("normal_maps")
+        or ["에란겔", "태이고", "미라마", "사녹", "비켄디"]
+    )
+    normalized["ranked_maps"] = (
+        normalized.get("ranked_maps")
+        or pa.get("ranked_maps")
+        or ["에란겔", "태이고", "미라마", "론도"]
+    )
+    normalized["map_report_url"] = (
+        normalized.get("map_report_url")
+        or pa.get("map_report_url")
+        or PUBG_MAP_REPORT_FALLBACK_URL
+    )
+
+    return normalized
+
+
+def _debug_test_config_summary(config: dict):
+    guilds = config.get("guilds") or {}
+
+    print(f"[TEST][CONFIG] guild_count={len(guilds)}")
+
+    for gid, raw_cfg in guilds.items():
+        if not isinstance(raw_cfg, dict):
+            print(f"[TEST][CONFIG] gid={gid} cfg=NOT_DICT")
+            continue
+
+        pa = raw_cfg.get("pubg_alert")
+        if not isinstance(pa, dict):
+            pa = {}
+
+        top_webhook = str(raw_cfg.get("webhook_url") or "").strip()
+        nested_webhook = str(pa.get("webhook_url") or "").strip()
+
+        normalized = _normalize_guild_cfg_for_alert(raw_cfg)
+
+        print(
+            f"[TEST][CONFIG] gid={gid} "
+            f"top_enabled={raw_cfg.get('enabled')} "
+            f"nested_enabled={pa.get('enabled')} "
+            f"top_webhook={_mask_webhook_for_log(top_webhook)} "
+            f"nested_webhook={_mask_webhook_for_log(nested_webhook)} "
+            f"normalized_enabled={normalized.get('enabled')} "
+            f"normalized_webhook={_mask_webhook_for_log(normalized.get('webhook_url'))} "
+            f"types={normalized.get('types')}"
+        )
+
+
 def get_test_guild_cfg(config: dict) -> tuple[str, dict]:
     """
     테스트에 사용할 guild 설정 선택.
@@ -1135,7 +1263,12 @@ def get_test_guild_cfg(config: dict) -> tuple[str, dict]:
     2) PUBG_ALERT_TEST_GUILD_ID에 해당하는 guild
     3) enabled=True 이고 webhook_url 있는 첫 guild
     4) webhook_url 있는 첫 guild
+
+    추가 대응:
+    - Secret에 실수로 로컬 guild_data 구조(pubg_alert.webhook_url)가 들어간 경우도 지원
     """
+    _debug_test_config_summary(config)
+
     direct_webhook = str(os.getenv("PUBG_ALERT_TEST_WEBHOOK_URL", "")).strip()
 
     if direct_webhook:
@@ -1153,38 +1286,42 @@ def get_test_guild_cfg(config: dict) -> tuple[str, dict]:
                 "labs": True,
                 "dev_notes": True,
             },
+            "normal_maps": ["에란겔", "태이고", "미라마", "사녹", "비켄디"],
+            "ranked_maps": ["에란겔", "태이고", "미라마", "론도"],
         }
 
     guilds = config.get("guilds") or {}
     test_gid = str(os.getenv("PUBG_ALERT_TEST_GUILD_ID", "")).strip()
 
     if test_gid:
-        cfg = guilds.get(test_gid)
+        raw_cfg = guilds.get(test_gid)
+        cfg = _normalize_guild_cfg_for_alert(raw_cfg)
 
         if isinstance(cfg, dict) and str(cfg.get("webhook_url") or "").strip():
             return test_gid, cfg
 
         raise RuntimeError(
-            f"PUBG_ALERT_TEST_GUILD_ID={test_gid} 서버 설정을 찾지 못했거나 webhook_url이 없습니다."
+            f"PUBG_ALERT_TEST_GUILD_ID={test_gid} 서버 설정을 찾지 못했거나 webhook_url이 없습니다. "
+            f"Actions 로그의 [TEST][CONFIG] 출력을 확인하세요."
         )
 
-    for gid, cfg in guilds.items():
-        if not isinstance(cfg, dict):
-            continue
+    for gid, raw_cfg in guilds.items():
+        cfg = _normalize_guild_cfg_for_alert(raw_cfg)
 
         if cfg.get("enabled") and str(cfg.get("webhook_url") or "").strip():
             return str(gid), cfg
 
-    for gid, cfg in guilds.items():
-        if not isinstance(cfg, dict):
-            continue
+    for gid, raw_cfg in guilds.items():
+        cfg = _normalize_guild_cfg_for_alert(raw_cfg)
 
         if str(cfg.get("webhook_url") or "").strip():
             return str(gid), cfg
 
     raise RuntimeError(
         "테스트에 사용할 webhook_url을 찾지 못했습니다. "
-        "PUBG_ALERT_TEST_WEBHOOK_URL을 지정하거나 PUBG_ALERT_CONFIG_JSON을 확인하세요."
+        "PUBG_ALERT_CONFIG_JSON 안에 guild 설정은 있지만, "
+        "webhook_url 또는 pubg_alert.webhook_url이 없습니다. "
+        "Actions 로그의 [TEST][CONFIG] 출력을 확인하세요."
     )
 
 
@@ -1366,14 +1503,27 @@ def main():
 
     guilds = config.get("guilds") or {}
 
-    for gid, guild_cfg in guilds.items():
-        if not isinstance(guild_cfg, dict):
+    print(f"[CONFIG] normal mode guild_count={len(guilds)}")
+
+    for gid, raw_guild_cfg in guilds.items():
+        if not isinstance(raw_guild_cfg, dict):
+            print(f"[SKIP] gid={gid} cfg=NOT_DICT")
             continue
+
+        # ✅ 테스트 모드와 동일하게 Secret 구조 정규화
+        guild_cfg = _normalize_guild_cfg_for_alert(raw_guild_cfg)
+
+        webhook_url = str(guild_cfg.get("webhook_url") or "").strip()
+
+        print(
+            f"[CONFIG] gid={gid} "
+            f"enabled={guild_cfg.get('enabled')} "
+            f"webhook={_mask_webhook_for_log(webhook_url)} "
+            f"types={guild_cfg.get('types')}"
+        )
 
         if not guild_cfg.get("enabled"):
             continue
-
-        webhook_url = str(guild_cfg.get("webhook_url") or "").strip()
 
         if not webhook_url:
             continue
