@@ -42,7 +42,6 @@ jobs:
           PUBG_ALERT_CONFIG_JSON: ${{ secrets.PUBG_ALERT_CONFIG_JSON }}
           PUBG_ALERT_TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
           PUBG_ALERT_TEST_KINDS: ${{ github.event.inputs.test_kinds || 'notice,patch_notes,labs,dev_notes,event,map_rotation' }}
-          PUBG_ALERT_TEST_WEBHOOK_URL: ${{ secrets.PUBG_ALERT_TEST_WEBHOOK_URL }}
         run: |
           python scripts/pubg_alert.py
 
