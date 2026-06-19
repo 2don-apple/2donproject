@@ -4,6 +4,7 @@ import json
 import html
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -14,12 +15,67 @@ CONFIG_JSON = os.getenv(CONFIG_SECRET_NAME, "").strip()
 
 STATE_FILE = Path("data/pubg_sent.json")
 
-PUBG_NEWS_URL = "https://pubg.com/en/news"
-PUBG_EVENT_URLS = [
-    "https://pubg.com/en/events/news",
-    "https://pubg.com/en/events",
-]
-PUBG_MAP_REPORT_FALLBACK_URL = "https://pubg.com/en/news/10181"
+# =========================
+# ✅ PUBG 공식 한국 페이지 기준
+# =========================
+PUBG_HOME = "https://www.pubg.com"
+PUBG_NEWS_URL = "https://www.pubg.com/ko/news"
+
+# ✅ 사용자가 확인한 한국 공식 카테고리 링크
+PUBG_KO_CATEGORY_URLS = {
+    "notice": {
+        "label": "공지사항",
+        "emoji": "📢",
+        "urls": [
+            "https://www.pubg.com/ko/news?category=notice",
+        ],
+    },
+    "patch_notes": {
+        "label": "패치노트",
+        "emoji": "🛠️",
+        "urls": [
+            "https://www.pubg.com/ko/news?category=patch_notes",
+        ],
+    },
+    "labs": {
+        "label": "LABS",
+        "emoji": "🧪",
+        "urls": [
+            "https://www.pubg.com/ko/news?category=labs",
+        ],
+    },
+    "dev_notes": {
+        "label": "개발일지",
+        "emoji": "📝",
+        "urls": [
+            "https://www.pubg.com/ko/news?category=dev_notes",
+        ],
+    },
+    # 기존 설정 types.event 호환용
+    # 한국 공식 이벤트 전용 카테고리 구조가 바뀔 수 있어서,
+    # 우선 ko/news 전체와 events 쪽도 같이 확인한다.
+    "event": {
+        "label": "이벤트",
+        "emoji": "🎁",
+        "urls": [
+            "https://www.pubg.com/ko/events/news",
+            "https://www.pubg.com/ko/events",
+            "https://www.pubg.com/ko/news",
+        ],
+    },
+}
+
+# ✅ 기존 맵 서비스 리포트 fallback
+PUBG_MAP_REPORT_FALLBACK_URL = "https://www.pubg.com/ko/news/10181"
+
+# ✅ Embed 색상
+PUBG_COLOR_NOTICE = 0xF2A900
+PUBG_COLOR_PATCH = 0x3498DB
+PUBG_COLOR_EVENT = 0x9B59B6
+PUBG_COLOR_MAP = 0x2ECC71
+
+# ✅ 웹훅 프로필 이미지
+PUBG_ALERT_AVATAR_URL = "https://raw.githubusercontent.com/2don-apple/2donproject/main/assets/pubg_alert_icon.png"
 
 KST = timezone(timedelta(hours=9))
 
@@ -34,6 +90,18 @@ MAP_KO = {
     "Rondo": "론도",
     "Deston": "데스턴",
     "Haven": "헤이븐",
+
+    # 한국어 페이지 파싱 대응
+    "에란겔": "에란겔",
+    "태이고": "태이고",
+    "미라마": "미라마",
+    "사녹": "사녹",
+    "비켄디": "비켄디",
+    "카라킨": "카라킨",
+    "파라모": "파라모",
+    "론도": "론도",
+    "데스턴": "데스턴",
+    "헤이븐": "헤이븐",
 }
 
 
@@ -64,18 +132,22 @@ def save_state(state: dict):
 def load_config() -> dict:
     if not CONFIG_JSON:
         raise RuntimeError(f"{CONFIG_SECRET_NAME} Secret이 비어있습니다.")
+
     data = json.loads(CONFIG_JSON)
+
     if not isinstance(data, dict):
         raise RuntimeError("PUBG alert config JSON 형식이 올바르지 않습니다.")
+
     data.setdefault("guilds", {})
     return data
 
 
 def fetch_html(url: str, timeout: int = 20) -> str:
     headers = {
-        "User-Agent": "DoniBot PUBG Alert/1.0 (+https://github.com/2don-apple/2donproject)",
-        "Accept-Language": "en-US,en;q=0.9,ko-KR;q=0.8,ko;q=0.7",
+        "User-Agent": "DoniBot PUBG Alert/1.1 (+https://github.com/2don-apple/2donproject)",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
     }
+
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.text
@@ -87,124 +159,294 @@ def clean_text(s: str) -> str:
     return s
 
 
+def trim_text(s: str, limit: int) -> str:
+    s = clean_text(s)
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 3)].rstrip() + "..."
+
+
 def soup_text_lines(raw_html: str) -> list[str]:
     soup = BeautifulSoup(raw_html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
     text = soup.get_text("\n", strip=True)
     lines = []
+
     for line in text.splitlines():
         t = clean_text(line)
         if t:
             lines.append(t)
+
     return lines
 
 
 def abs_pubg_url(href: str) -> str:
     href = str(href or "").strip()
+
     if not href:
         return ""
+
     if href.startswith("http://") or href.startswith("https://"):
         return href
-    if href.startswith("/"):
-        return "https://pubg.com" + href
-    return "https://pubg.com/" + href
+
+    return urljoin(PUBG_HOME, href)
 
 
 def article_id_from_url(url: str) -> str:
     m = re.search(r"/news/(\d+)", url)
     if m:
         return m.group(1)
+
     return re.sub(r"\W+", "_", url).strip("_")
 
 
-def parse_article(url: str) -> dict | None:
+def extract_meta_content(soup: BeautifulSoup, *keys: str) -> str:
+    for key in keys:
+        tag = soup.find("meta", attrs={"property": key})
+        if tag and tag.get("content"):
+            return clean_text(tag.get("content"))
+
+        tag = soup.find("meta", attrs={"name": key})
+        if tag and tag.get("content"):
+            return clean_text(tag.get("content"))
+
+    return ""
+
+
+def extract_article_image(soup: BeautifulSoup, page_url: str) -> str:
+    # ✅ 공식 페이지 대표 이미지 우선
+    img = extract_meta_content(
+        soup,
+        "og:image",
+        "twitter:image",
+        "twitter:image:src",
+    )
+
+    if img:
+        return abs_pubg_url(img)
+
+    # ✅ fallback: 본문 이미지 후보
+    for tag in soup.find_all("img"):
+        src = tag.get("src") or tag.get("data-src") or tag.get("data-lazy-src")
+        src = abs_pubg_url(src)
+
+        if not src:
+            continue
+
+        low = src.lower()
+
+        # 아이콘/로고류 제외
+        if any(x in low for x in ("logo", "icon", "favicon", "sprite")):
+            continue
+
+        return src
+
+    return ""
+
+
+def detect_category_from_url(url: str) -> str:
+    u = str(url or "").lower()
+
+    if "patch_notes" in u or "patch-notes" in u:
+        return "patch_notes"
+
+    if "dev_notes" in u or "dev-notes" in u:
+        return "dev_notes"
+
+    if "labs" in u:
+        return "labs"
+
+    if "event" in u or "/events" in u:
+        return "event"
+
+    return "notice"
+
+
+def category_label(category: str) -> str:
+    info = PUBG_KO_CATEGORY_URLS.get(category) or PUBG_KO_CATEGORY_URLS["notice"]
+    return info["label"]
+
+
+def category_emoji(category: str) -> str:
+    info = PUBG_KO_CATEGORY_URLS.get(category) or PUBG_KO_CATEGORY_URLS["notice"]
+    return info["emoji"]
+
+
+# =========================
+# ✅ 알림 상위/하위 카테고리 표시 정책
+# - notice / patch_notes / labs / dev_notes 는 모두 "공지사항"으로 묶음
+# - 실제 세부 타입은 #패치노트, #LABS 처럼 태그로 표시
+# =========================
+NOTICE_GROUP_KINDS = {"notice", "patch_notes", "labs", "dev_notes"}
+
+CATEGORY_HASHTAG = {
+    "notice": "#공지사항",
+    "patch_notes": "#패치노트",
+    "labs": "#LABS",
+    "dev_notes": "#개발일지",
+    "event": "#이벤트",
+}
+
+
+def primary_alert_kind(category: str) -> str:
+    category = str(category or "notice").strip()
+
+    if category in NOTICE_GROUP_KINDS:
+        return "notice"
+
+    return category
+
+
+def primary_category_label(category: str) -> str:
+    primary = primary_alert_kind(category)
+
+    if primary == "notice":
+        return "공지사항"
+
+    return category_label(primary)
+
+
+def secondary_category_label(category: str) -> str:
+    return category_label(category)
+
+
+def secondary_category_hashtag(category: str) -> str:
+    category = str(category or "notice").strip()
+    return CATEGORY_HASHTAG.get(category, f"#{category_label(category)}")
+
+
+def category_color(category: str) -> int:
+    primary = primary_alert_kind(category)
+
+    if primary == "event":
+        return PUBG_COLOR_EVENT
+
+    if primary == "notice":
+        return PUBG_COLOR_NOTICE
+
+    return PUBG_COLOR_NOTICE
+
+
+def category_main_emoji(category: str) -> str:
+    primary = primary_alert_kind(category)
+
+    if primary == "event":
+        return "🎁"
+
+    if primary == "notice":
+        return "📢"
+
+    return category_emoji(category)
+
+
+def parse_article(url: str, forced_category: str = "") -> dict | None:
     try:
         raw = fetch_html(url)
     except Exception as e:
         print(f"[WARN] article fetch failed url={url} err={type(e).__name__}: {e}")
         return None
 
+    soup = BeautifulSoup(raw, "html.parser")
     lines = soup_text_lines(raw)
+
     if not lines:
         return None
 
+    meta_title = extract_meta_content(soup, "og:title", "twitter:title")
+    meta_desc = extract_meta_content(soup, "og:description", "twitter:description", "description")
+    image_url = extract_article_image(soup, url)
+
     title = ""
     date = ""
-    category = ""
+    category = forced_category or detect_category_from_url(url)
 
-    for i, line in enumerate(lines):
-        if line.upper() in ("PC", "CONSOLE"):
-            continue
-
-        if re.search(r"\d{4}\.\d{2}\.\d{2}", line):
-            date = re.search(r"\d{4}\.\d{2}\.\d{2}", line).group(0)
-            if i >= 1:
-                category = lines[i - 1]
+    # ✅ 날짜 탐색: 2026.06.20 / 2026-06-20 모두 대응
+    for line in lines[:120]:
+        m = re.search(r"20\d{2}[.\-/]\d{1,2}[.\-/]\d{1,2}", line)
+        if m:
+            date = m.group(0).replace("-", ".").replace("/", ".")
             break
 
-    # 제목 후보: 날짜 앞쪽의 가장 기사 제목 같은 줄
-    for i, line in enumerate(lines[:80]):
-        if line in ("ENGLISH (GLOBAL)", "PLAY NOW", "GO BACK TO LIST", "PC", "CONSOLE"):
-            continue
-        if line.startswith("Image:"):
-            continue
-        if re.search(r"\d{4}\.\d{2}\.\d{2}", line):
-            break
-        if len(line) >= 4:
-            title = line
-            # 페이지 제목 이후 더 나은 제목이 나오면 갱신
-            if " - NEWS" not in line:
-                pass
+    # ✅ 제목은 meta title 우선
+    if meta_title:
+        title = meta_title
+        title = re.sub(r"\s*\|\s*PUBG.*$", "", title, flags=re.I).strip()
+        title = re.sub(r"\s*-\s*PUBG.*$", "", title, flags=re.I).strip()
 
-    # 실제 페이지 구조에서 ### 제목이 텍스트로 들어오는 경우 보정
-    for line in lines[:80]:
-        if line in ("PC", "CONSOLE", "GO BACK TO LIST"):
-            continue
-        if line.upper() in ("ANNOUNCEMENT", "PATCH NOTES", "DEV LETTER", "ESPORTS"):
-            continue
-        if re.search(r"\d{4}\.\d{2}\.\d{2}", line):
-            continue
-        if "PUBG BATTLEGROUNDS" in line:
-            continue
-        if len(line) >= 4 and not line.startswith("Image:"):
-            title = line
-            break
+    # ✅ meta title이 이상하면 본문 후보에서 추출
+    if not title or len(title) < 4:
+        skip_words = {
+            "PUBG: BATTLEGROUNDS",
+            "PUBG",
+            "뉴스",
+            "공지사항",
+            "패치노트",
+            "개발일지",
+            "이벤트",
+            "LABS",
+            "PLAY NOW",
+            "GO BACK TO LIST",
+            "PC",
+            "CONSOLE",
+            "KRAFTON",
+        }
+
+        for line in lines[:100]:
+            if line in skip_words:
+                continue
+            if re.search(r"20\d{2}[.\-/]\d{1,2}[.\-/]\d{1,2}", line):
+                continue
+            if len(line) >= 4 and not line.startswith("Image:"):
+                title = line
+                break
 
     full_text = "\n".join(lines)
 
-    platform_pc = "\nPC\n" in "\n" + full_text + "\n" or " PC " in full_text
-    platform_console = "\nCONSOLE\n" in "\n" + full_text + "\n" or " CONSOLE " in full_text
+    # ✅ PC / Console 필터
+    # - Console 전용 글은 제외
+    # - PC 태그가 있거나 플랫폼 태그가 애매하면 허용
+    platform_pc = bool(re.search(r"(^|\n|\s)PC($|\n|\s)", full_text, re.I))
+    platform_console = bool(re.search(r"(^|\n|\s)CONSOLE($|\n|\s)", full_text, re.I))
 
-    # ✅ Steam / PC 기준
-    # - PC 태그가 있거나, 콘솔 전용이 아니면 허용
-    # - Console only는 제외
     if platform_console and not platform_pc:
         return None
 
     # ✅ KAKAO 전용 제외
-    if "KAKAO" in full_text and not platform_pc:
+    if "KAKAO" in full_text.upper() and not platform_pc:
         return None
 
-    desc = ""
-    for line in lines[80:180]:
-        if line.startswith("Image:"):
-            continue
-        if line.upper() in ("PREV", "NEXT"):
-            break
-        if len(line) >= 20:
-            desc = line
-            break
+    desc = meta_desc
+
+    if not desc:
+        for line in lines[80:220]:
+            if line.startswith("Image:"):
+                continue
+
+            up = line.upper()
+
+            if up in ("PREV", "NEXT", "GO BACK TO LIST"):
+                break
+
+            if len(line) >= 20:
+                desc = line
+                break
 
     return {
         "id": article_id_from_url(url),
-        "title": clean_text(title),
-        "date": date,
-        "category": clean_text(category),
+        "title": trim_text(title, 240),
+        "date": clean_text(date),
+        "category": category,
+        "category_label": category_label(category),
         "url": url,
-        "description": clean_text(desc),
+        "description": trim_text(desc, 360),
+        "image_url": image_url,
     }
 
 
-def collect_article_urls_from_page(url: str, limit: int = 12) -> list[str]:
+def collect_article_urls_from_page(url: str, limit: int = 16) -> list[str]:
     try:
         raw = fetch_html(url)
     except Exception as e:
@@ -214,61 +456,93 @@ def collect_article_urls_from_page(url: str, limit: int = 12) -> list[str]:
     soup = BeautifulSoup(raw, "html.parser")
     urls = []
 
-    for a in soup.find_all("a", href=True):
-        href = abs_pubg_url(a.get("href"))
-        if not re.search(r"/(?:en/)?news/\d+", href):
-            continue
+    def add_url(href: str):
+        href = abs_pubg_url(href)
+
+        if not href:
+            return
+
+        # ✅ 한국/영문 news 모두 허용
+        if not re.search(r"/(?:ko|en)/news/\d+", href):
+            return
+
         if href not in urls:
             urls.append(href)
 
+    for a in soup.find_all("a", href=True):
+        add_url(a.get("href"))
+
     # HTML 안에 직접 들어있는 링크도 추가
-    for m in re.finditer(r'href=["\']([^"\']*/news/\d+[^"\']*)["\']', raw):
-        href = abs_pubg_url(m.group(1))
-        if href not in urls:
-            urls.append(href)
+    for m in re.finditer(r'href=["\']([^"\']*/(?:ko|en)/news/\d+[^"\']*)["\']', raw):
+        add_url(m.group(1))
+
+    # Next.js JSON 안의 escaped URL 대응
+    for m in re.finditer(r'\\?"url\\?"\s*:\s*\\?"([^"\\]*(?:/ko/news/|/en/news/)\d+[^"\\]*)\\?"', raw):
+        add_url(m.group(1).replace("\\/", "/"))
 
     return urls[:limit]
 
 
 def get_latest_articles(kind: str, limit: int = 3) -> list[dict]:
+    """
+    kind:
+      - notice
+      - event
+      - patch_notes
+      - labs
+      - dev_notes
+    """
+    info = PUBG_KO_CATEGORY_URLS.get(kind) or PUBG_KO_CATEGORY_URLS["notice"]
+    pages = list(info.get("urls") or [])
+
+    # ✅ event는 공식 페이지 구조가 바뀌는 경우가 있어서 넓게 검사
     if kind == "event":
-        pages = PUBG_EVENT_URLS + [
-            "https://pubg.com/en/news?category=event",
-            "https://pubg.com/en/news",
-        ]
-        event_keywords = ("event", "challenge", "reward", "mission", "pass", "pnc", "fantasy")
+        event_keywords = (
+            "이벤트",
+            "보상",
+            "미션",
+            "패스",
+            "event",
+            "reward",
+            "mission",
+            "pass",
+            "challenge",
+        )
     else:
-        pages = [
-            "https://pubg.com/en/news",
-            "https://pubg.com/en/news?category=announcement",
-            "https://pubg.com/en/news?category=notice",
-        ]
         event_keywords = ()
 
     urls = []
+
     for page in pages:
-        for u in collect_article_urls_from_page(page, limit=16):
+        for u in collect_article_urls_from_page(page, limit=24):
             if u not in urls:
                 urls.append(u)
 
     articles = []
+
     for url in urls:
-        article = parse_article(url)
+        article = parse_article(url, forced_category=kind)
+
         if not article:
             continue
 
-        title_l = article["title"].lower()
-        cat_l = article["category"].lower()
+        title_l = article.get("title", "").lower()
+        desc_l = article.get("description", "").lower()
+        cat_l = article.get("category_label", "").lower()
 
+        # ✅ 이벤트는 이벤트성 글만 최대한 필터링
         if kind == "event":
-            if not any(k in title_l or k in cat_l for k in event_keywords):
+            target = f"{title_l} {desc_l} {cat_l}"
+            if not any(k.lower() in target for k in event_keywords):
                 continue
-        else:
-            # 공지사항은 이벤트성 글은 너무 많이 섞이지 않게 약하게 제외
-            if "esports" in cat_l:
+
+        # ✅ e스포츠는 공지에서 제외
+        if kind in ("notice", "patch_notes", "labs", "dev_notes"):
+            if "esports" in title_l or "e스포츠" in title_l or "이스포츠" in title_l:
                 continue
 
         articles.append(article)
+
         if len(articles) >= limit:
             break
 
@@ -276,21 +550,31 @@ def get_latest_articles(kind: str, limit: int = 3) -> list[dict]:
 
 
 def find_latest_map_report_url() -> str:
-    urls = collect_article_urls_from_page("https://pubg.com/en/news", limit=30)
     candidates = []
 
-    for url in urls:
-        try:
-            article = parse_article(url)
-        except Exception:
-            article = None
+    # ✅ 한국 페이지 우선
+    pages = [
+        "https://www.pubg.com/ko/news?category=notice",
+        "https://www.pubg.com/ko/news?category=patch_notes",
+        "https://www.pubg.com/ko/news",
+        "https://www.pubg.com/en/news",
+    ]
 
-        if not article:
-            continue
+    for page in pages:
+        for url in collect_article_urls_from_page(page, limit=30):
+            try:
+                article = parse_article(url)
+            except Exception:
+                article = None
 
-        title = article.get("title", "")
-        if "Map Service Report" in title:
-            candidates.append(url)
+            if not article:
+                continue
+
+            title = article.get("title", "")
+            title_l = title.lower()
+
+            if "map service report" in title_l or "맵 서비스 리포트" in title:
+                candidates.append(url)
 
     if candidates:
         return candidates[0]
@@ -300,6 +584,7 @@ def find_latest_map_report_url() -> str:
 
 def lines_between(lines: list[str], start_pat: str, end_pats: tuple[str, ...]) -> list[str]:
     start = -1
+
     for i, line in enumerate(lines):
         if re.search(start_pat, line, re.I):
             start = i
@@ -309,6 +594,7 @@ def lines_between(lines: list[str], start_pat: str, end_pats: tuple[str, ...]) -
         return []
 
     end = len(lines)
+
     for j in range(start + 1, len(lines)):
         if any(re.search(p, lines[j], re.I) for p in end_pats):
             end = j
@@ -318,21 +604,36 @@ def lines_between(lines: list[str], start_pat: str, end_pats: tuple[str, ...]) -
 
 
 def parse_schedule(lines: list[str]) -> list[dict]:
-    block = lines_between(lines, r"^Schedule$", (r"^Normal Match$",))
+    block = lines_between(
+        lines,
+        r"^(Schedule|일정)$",
+        (
+            r"^(Normal Match|일반전)$",
+            r"^일반 매치$",
+        )
+    )
+
     result = []
 
-    # 공식 페이지 텍스트 구조:
-    # Week 1 / June 17 / June 25 / Week 2 / June 24 ...
     for i, line in enumerate(block):
-        m = re.fullmatch(r"Week\s+(\d+)", line, re.I)
+        m = re.fullmatch(r"(?:Week|주차)\s*(\d+)|(\d+)\s*주차", line, re.I)
         if not m:
             continue
 
-        week = int(m.group(1))
+        week = int(m.group(1) or m.group(2))
         pc_date = ""
-        for j in range(i + 1, min(i + 5, len(block))):
-            if re.fullmatch(r"[A-Za-z]+\s+\d{1,2}", block[j]):
-                pc_date = block[j]
+
+        for j in range(i + 1, min(i + 8, len(block))):
+            t = block[j]
+
+            # June 17
+            if re.fullmatch(r"[A-Za-z]+\s+\d{1,2}", t):
+                pc_date = t
+                break
+
+            # 6월 17일
+            if re.fullmatch(r"\d{1,2}\s*월\s*\d{1,2}\s*일", t):
+                pc_date = t
                 break
 
         if pc_date:
@@ -342,24 +643,46 @@ def parse_schedule(lines: list[str]) -> list[dict]:
 
 
 def parse_normal_as_maps(lines: list[str]) -> dict[int, list[str]]:
-    normal_block = lines_between(lines, r"^Normal Match$", (r"^Ranked$",))
-    as_block = lines_between(normal_block, r"^AS$", (r"^SEA$", r"^KAKAO$", r"^NA$", r"^SA$", r"^EU$", r"^RU$", r"^Console"))
+    normal_block = lines_between(
+        lines,
+        r"^(Normal Match|일반전|일반 매치)$",
+        (
+            r"^(Ranked|경쟁전|랭크)$",
+        )
+    )
+
+    as_block = lines_between(
+        normal_block,
+        r"^AS$|^아시아$",
+        (
+            r"^SEA$",
+            r"^KAKAO$",
+            r"^NA$",
+            r"^SA$",
+            r"^EU$",
+            r"^RU$",
+            r"^Console",
+            r"^콘솔",
+        )
+    )
 
     result = {}
 
     for i, line in enumerate(as_block):
-        m = re.fullmatch(r"Week\s+(\d+)", line, re.I)
+        m = re.fullmatch(r"(?:Week|주차)\s*(\d+)|(\d+)\s*주차", line, re.I)
         if not m:
             continue
 
-        week = int(m.group(1))
+        week = int(m.group(1) or m.group(2))
         maps = []
 
         for t in as_block[i + 1:]:
-            if re.fullmatch(r"Week\s+\d+", t, re.I):
+            if re.fullmatch(r"(?:Week|주차)\s*\d+|\d+\s*주차", t, re.I):
                 break
-            if t in ("Fixed", "Favored", "Etc."):
+
+            if t in ("Fixed", "Favored", "Etc.", "고정", "선호", "기타"):
                 continue
+
             if t in MAP_KO:
                 maps.append(MAP_KO[t])
 
@@ -370,24 +693,52 @@ def parse_normal_as_maps(lines: list[str]) -> dict[int, list[str]]:
 
 
 def parse_ranked_maps(lines: list[str]) -> list[str]:
-    ranked_block = lines_between(lines, r"^Ranked$", (r"We’ll see you", r"PUBG: BATTLEGROUNDS Team", r"^PREV$", r"^NEXT$"))
+    ranked_block = lines_between(
+        lines,
+        r"^(Ranked|경쟁전|랭크)$",
+        (
+            r"We’ll see you",
+            r"PUBG: BATTLEGROUNDS Team",
+            r"PUBG: 배틀그라운드 팀",
+            r"^PREV$",
+            r"^NEXT$",
+            r"^이전$",
+            r"^다음$",
+        )
+    )
+
     text = " ".join(ranked_block)
 
     maps = []
+
     for name in MAP_KO:
         if re.search(rf"\b{re.escape(name)}\b", text):
             maps.append(MAP_KO[name])
 
-    # 공식 표 순서 보정
-    order = ["에란겔", "미라마", "태이고", "론도", "비켄디", "데스턴", "사녹", "카라킨", "파라모"]
+    order = ["에란겔", "미라마", "태이고", "론도", "비켄디", "데스턴", "사녹", "카라킨", "파라모", "헤이븐"]
     maps = [m for m in order if m in maps]
 
     return maps
 
 
 def parse_month_day(s: str, year: int) -> datetime:
-    dt = datetime.strptime(f"{year} {s}", "%Y %B %d")
-    return dt.replace(tzinfo=KST)
+    s = clean_text(s)
+
+    # June 17
+    try:
+        dt = datetime.strptime(f"{year} {s}", "%Y %B %d")
+        return dt.replace(tzinfo=KST)
+    except Exception:
+        pass
+
+    # 6월 17일
+    m = re.fullmatch(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", s)
+    if m:
+        month = int(m.group(1))
+        day = int(m.group(2))
+        return datetime(year, month, day, tzinfo=KST)
+
+    raise ValueError(f"날짜 파싱 실패: {s}")
 
 
 def current_week_from_schedule(schedule: list[dict], ref: datetime) -> tuple[int, datetime, datetime] | None:
@@ -456,6 +807,7 @@ def get_current_map_rotation(guild_cfg: dict) -> dict:
         ranked = parse_ranked_maps(lines)
 
         picked = current_week_from_schedule(schedule, now_kst())
+
         if not picked:
             raise RuntimeError("현재 주차를 찾지 못했습니다.")
 
@@ -487,21 +839,30 @@ def format_date(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y.%m.%d")
 
 
-def discord_post(webhook_url: str, content: str):
+def embed_footer() -> dict:
+    return {
+        "text": "기준: Steam / PC / AS 서버 · PUBG 공식 홈페이지",
+    }
+
+
+def discord_post(webhook_url: str, content: str = "", embed: dict | None = None):
+    payload = {
+        "username": "PUBG 알림",
+        "avatar_url": PUBG_ALERT_AVATAR_URL,
+        "allowed_mentions": {"parse": []},
+    }
+
+    if content:
+        payload["content"] = content
+
+    if embed:
+        payload["embeds"] = [embed]
+    else:
+        payload["content"] = content or ""
+
     r = requests.post(
         webhook_url,
-        json={
-            # ✅ 웹훅 표시 이름
-            "username": "PUBG 알림",
-
-            # ✅ 웹훅 프로필 이미지
-            # 반드시 외부에서 접근 가능한 이미지 URL이어야 함
-            # 예: GitHub raw 이미지 URL, Discord CDN 이미지 URL 등
-            "avatar_url": "https://raw.githubusercontent.com/2don-apple/2donproject/main/assets/pubg_alert_icon.png",
-
-            "content": content,
-            "allowed_mentions": {"parse": []},
-        },
+        json=payload,
         timeout=20,
     )
     r.raise_for_status()
@@ -515,64 +876,227 @@ def mark_sent(state: dict, key: str):
     state[key] = now_kst().isoformat()
 
 
+def build_map_rotation_embed(data: dict) -> dict:
+    normal_text = " / ".join(data["normal"])
+    ranked_text = " / ".join(data["ranked"])
+
+    desc = (
+        "이번 주 PUBG 맵 로테이션 정보입니다.\n"
+        "공식 맵 서비스 리포트 기준으로 확인한 내용을 정리했습니다."
+    )
+
+    if data.get("fallback"):
+        desc += "\n\n⚠️ 공식 페이지 파싱에 실패하여 저장된 기본 맵 정보로 안내합니다."
+
+    return {
+        "color": PUBG_COLOR_MAP,
+        "author": {
+            "name": "PUBG: BATTLEGROUNDS",
+            "url": PUBG_HOME,
+        },
+        "title": "🗺️ PUBG 맵 로테이션 안내",
+        "url": data.get("source_url") or PUBG_MAP_REPORT_FALLBACK_URL,
+        "description": desc,
+        "fields": [
+            {
+                "name": "기준",
+                "value": "Steam / PC / AS 서버",
+                "inline": True,
+            },
+            {
+                "name": "기간",
+                "value": f"{format_date(data['start'])} ~ {format_date(data['end'])}",
+                "inline": True,
+            },
+            {
+                "name": "이번 주 일반전 맵",
+                "value": normal_text or "-",
+                "inline": False,
+            },
+            {
+                "name": "이번 주 경쟁전 맵",
+                "value": ranked_text or "-",
+                "inline": False,
+            },
+        ],
+        "footer": embed_footer(),
+        "timestamp": now_kst().isoformat(),
+    }
+
+
+def build_article_embed(article: dict, kind: str) -> dict:
+    category = article.get("category") or kind
+
+    primary_label = primary_category_label(category)
+    secondary_label = secondary_category_label(category)
+    secondary_tag = secondary_category_hashtag(category)
+
+    emoji = category_main_emoji(category)
+    color = category_color(category)
+
+    article_title = article.get("title") or "PUBG 공식 공지"
+    article_desc = article.get("description") or "자세한 내용은 PUBG 공식 홈페이지에서 확인하세요."
+
+    # ✅ Embed 제목은 상위 분류 기준으로 통일
+    # 예: 📢 PUBG 공지사항 안내 #패치노트
+    # 예: 🎁 PUBG 이벤트 안내
+    if primary_alert_kind(category) == "notice":
+        embed_title = f"{emoji} PUBG {primary_label} 안내 {secondary_tag}"
+    else:
+        embed_title = f"{emoji} PUBG {primary_label} 안내"
+
+    # ✅ 본문 첫 줄에 실제 공식 글 제목 표시
+    description = f"**{article_title}**"
+
+    if article_desc:
+        description += f"\n\n{article_desc}"
+
+    embed = {
+        "color": color,
+        "author": {
+            "name": "PUBG: BATTLEGROUNDS",
+            "url": PUBG_HOME,
+        },
+        "title": embed_title,
+        "url": article.get("url") or PUBG_NEWS_URL,
+        "description": description,
+        "fields": [
+            {
+                "name": "알림 분류",
+                "value": primary_label,
+                "inline": True,
+            },
+            {
+                "name": "세부 타입",
+                "value": secondary_tag if primary_alert_kind(category) == "notice" else secondary_label,
+                "inline": True,
+            },
+            {
+                "name": "게시일",
+                "value": article.get("date") or "-",
+                "inline": True,
+            },
+            {
+                "name": "기준",
+                "value": "Steam / PC / AS 서버",
+                "inline": True,
+            },
+            {
+                "name": "바로가기",
+                "value": f"[공식 홈페이지에서 보기]({article.get('url') or PUBG_NEWS_URL})",
+                "inline": False,
+            },
+        ],
+        "footer": embed_footer(),
+        "timestamp": now_kst().isoformat(),
+    }
+
+    image_url = article.get("image_url") or ""
+
+    if image_url:
+        embed["image"] = {"url": image_url}
+
+    return embed
+
+
 def send_map_rotation_for_guild(gid: str, guild_cfg: dict, state: dict):
     data = get_current_map_rotation(guild_cfg)
 
     key = f"{gid}:map_rotation:{format_date(data['start'])}:{format_date(data['end'])}"
+
     if not should_send(state, key):
         print(f"[SKIP] map already sent gid={gid} key={key}")
         return
 
-    normal_text = " / ".join(data["normal"])
-    ranked_text = " / ".join(data["ranked"])
+    embed = build_map_rotation_embed(data)
 
-    content = (
-        "🗺️ PUBG 맵 로테이션 안내\n\n"
-        "기준: Steam / PC / AS 서버\n"
-        f"기간: {format_date(data['start'])} ~ {format_date(data['end'])}\n\n"
-        "이번 주 일반전 맵:\n"
-        f"{normal_text}\n"
-        "이번주 경쟁전 맵:\n"
-        f"{ranked_text}"
-    )
-
-    discord_post(guild_cfg["webhook_url"], content)
+    discord_post(guild_cfg["webhook_url"], embed=embed)
     mark_sent(state, key)
 
     print(f"[SENT] map rotation gid={gid} week={data['week']} fallback={data['fallback']}")
 
 
+def article_state_keys(gid: str, kind: str, article_id: str) -> list[str]:
+    """
+    ✅ 중복 발송 방지 키
+    - notice / patch_notes / labs / dev_notes 는 상위 분류 notice로 묶어서 중복 방지
+    - 기존에 patch_notes/labs/dev_notes 키로 저장된 기록도 같이 확인해서 업데이트 직후 재발송 방지
+    """
+    primary = primary_alert_kind(kind)
+
+    keys = [
+        f"{gid}:{primary}:{article_id}",
+    ]
+
+    legacy_key = f"{gid}:{kind}:{article_id}"
+
+    if legacy_key not in keys:
+        keys.append(legacy_key)
+
+    return keys
+
+
+def article_already_sent(state: dict, gid: str, kind: str, article_id: str) -> bool:
+    return any(bool(state.get(k)) for k in article_state_keys(gid, kind, article_id))
+
+
+def mark_article_sent(state: dict, gid: str, kind: str, article_id: str):
+    sent_at = now_kst().isoformat()
+
+    for key in article_state_keys(gid, kind, article_id):
+        state[key] = sent_at
+
+
 def send_articles_for_guild(gid: str, guild_cfg: dict, kind: str, state: dict):
     articles = get_latest_articles(kind, limit=3)
 
-    label = "공지사항" if kind == "notice" else "이벤트"
-    emoji = "📢" if kind == "notice" else "🎁"
+    label = category_label(kind)
+
+    if not articles:
+        print(f"[INFO] no articles found gid={gid} kind={kind} label={label}")
+        return
 
     for article in articles:
-        key = f"{gid}:{kind}:{article['id']}"
-        if not should_send(state, key):
-            print(f"[SKIP] {kind} already sent gid={gid} id={article['id']}")
+        article_id = str(article.get("id") or "").strip()
+
+        if not article_id:
             continue
 
-        desc = article.get("description") or ""
-        if len(desc) > 180:
-            desc = desc[:177] + "..."
+        # ✅ 공지사항 그룹(notice/patch_notes/labs/dev_notes)은 하나로 묶어서 중복 방지
+        if article_already_sent(state, gid, kind, article_id):
+            print(f"[SKIP] {kind} already sent gid={gid} id={article_id}")
+            continue
 
-        content = (
-            f"{emoji} PUBG {label} 안내\n\n"
-            "기준: Steam / PC / AS 서버\n"
-            f"제목: {article['title']}\n"
-            f"날짜: {article.get('date') or '-'}\n"
-            f"링크: {article['url']}"
+        embed = build_article_embed(article, kind)
+
+        discord_post(guild_cfg["webhook_url"], embed=embed)
+        mark_article_sent(state, gid, kind, article_id)
+
+        primary = primary_category_label(kind)
+        secondary = secondary_category_hashtag(kind)
+
+        print(
+            f"[SENT] {primary} {secondary} gid={gid} "
+            f"id={article_id} title={article.get('title')}"
         )
 
-        if desc:
-            content += f"\n\n{desc}"
 
-        discord_post(guild_cfg["webhook_url"], content)
-        mark_sent(state, key)
+def enabled_types_from_config(guild_cfg: dict) -> dict:
+    types = guild_cfg.get("types") or {}
 
-        print(f"[SENT] {kind} gid={gid} id={article['id']} title={article['title']}")
+    result = {
+        "map_rotation": bool(types.get("map_rotation")),
+        "notice": bool(types.get("notice")),
+        "event": bool(types.get("event")),
+    }
+
+    # ✅ 새 카테고리 세분화 설정이 Secret에 들어온 경우 그대로 사용
+    # 아직 봇 설정 UI가 notice/event만 저장하더라도 아래 기본값으로 작동함.
+    result["patch_notes"] = bool(types.get("patch_notes", result["notice"]))
+    result["labs"] = bool(types.get("labs", result["notice"]))
+    result["dev_notes"] = bool(types.get("dev_notes", result["notice"]))
+
+    return result
 
 
 def main():
@@ -589,6 +1113,7 @@ def main():
             continue
 
         webhook_url = str(guild_cfg.get("webhook_url") or "").strip()
+
         if not webhook_url:
             continue
 
@@ -597,14 +1122,28 @@ def main():
         guild_cfg["device"] = "pc"
         guild_cfg["server_region"] = "as"
 
-        types = guild_cfg.get("types") or {}
+        types = enabled_types_from_config(guild_cfg)
 
         if types.get("map_rotation"):
             send_map_rotation_for_guild(str(gid), guild_cfg, state)
 
+        # ✅ 공지사항: notice
         if types.get("notice"):
             send_articles_for_guild(str(gid), guild_cfg, "notice", state)
 
+        # ✅ 패치노트: patch_notes
+        if types.get("patch_notes"):
+            send_articles_for_guild(str(gid), guild_cfg, "patch_notes", state)
+
+        # ✅ LABS: labs
+        if types.get("labs"):
+            send_articles_for_guild(str(gid), guild_cfg, "labs", state)
+
+        # ✅ 개발일지: dev_notes
+        if types.get("dev_notes"):
+            send_articles_for_guild(str(gid), guild_cfg, "dev_notes", state)
+
+        # ✅ 기존 이벤트 설정 호환
         if types.get("event"):
             send_articles_for_guild(str(gid), guild_cfg, "event", state)
 
