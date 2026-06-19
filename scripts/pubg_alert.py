@@ -58,9 +58,8 @@ PUBG_KO_CATEGORY_URLS = {
         "label": "이벤트",
         "emoji": "🎁",
         "urls": [
-            "https://www.pubg.com/ko/events/news",
+            "https://www.pubg.com/ko/events/notice",
             "https://www.pubg.com/ko/events",
-            "https://www.pubg.com/ko/news",
         ],
     },
 }
@@ -482,6 +481,219 @@ def collect_article_urls_from_page(url: str, limit: int = 16) -> list[str]:
 
     return urls[:limit]
 
+LIST_DATE_RE = re.compile(
+    r"20\d{2}[.\-/]\d{1,2}[.\-/]\d{1,2}"
+)
+
+LIST_CATEGORY_TO_KIND = {
+    "공지": "notice",
+    "공지사항": "notice",
+    "ANNOUNCEMENT": "notice",
+    "패치노트": "patch_notes",
+    "PATCH NOTES": "patch_notes",
+    "LABS": "labs",
+    "개발일지": "dev_notes",
+    "DEV LETTER": "dev_notes",
+    "이벤트": "event",
+    "EVENT": "event",
+}
+
+LIST_NOISE_WORDS = {
+    "뉴스",
+    "이벤트",
+    "전체",
+    "공지",
+    "공지사항",
+    "패치노트",
+    "아케이드",
+    "개발일지",
+    "유니버스",
+    "진행 중",
+    "종료",
+    "당첨자 발표",
+    "PC",
+    "콘솔",
+    "CONSOLE",
+    "ESPORTS",
+    "이스포츠",
+    "제목+본문",
+    "TITLE+CONTENT",
+    "더 보기",
+    "PLAY NOW",
+}
+
+
+def _is_list_noise_line(s: str) -> bool:
+    s = clean_text(s)
+
+    if not s:
+        return True
+
+    if s in LIST_NOISE_WORDS:
+        return True
+
+    if re.fullmatch(r"D-\d+", s):
+        return True
+
+    if s.startswith("Image:"):
+        return True
+
+    if s.startswith("이미지:"):
+        return True
+
+    return False
+
+
+def _kind_matches_list_category(request_kind: str, found_kind: str) -> bool:
+    request_kind = str(request_kind or "").strip()
+    found_kind = str(found_kind or "").strip()
+
+    if request_kind == found_kind:
+        return True
+
+    return False
+
+
+def _stable_list_article_id(kind: str, title: str, date: str) -> str:
+    raw = f"{kind}:{date}:{title}"
+    article_id = re.sub(r"\W+", "_", raw).strip("_")
+
+    if not article_id:
+        article_id = f"{kind}_{date}"
+
+    return article_id[:180]
+
+
+def collect_articles_from_list_page(page_url: str, kind: str, limit: int = 3) -> list[dict]:
+    """
+    PUBG 목록 페이지 fallback 파서.
+
+    PUBG 공식 목록 페이지에서 상세글 href가 안 잡히는 경우,
+    페이지에 노출된 제목/날짜/카테고리 텍스트만으로 알림용 article dict를 만든다.
+
+    이 fallback은 상세글 URL 대신 목록 페이지 URL을 사용한다.
+    """
+    try:
+        raw = fetch_html(page_url)
+    except Exception as e:
+        print(f"[WARN] list text fetch failed url={page_url} err={type(e).__name__}: {e}")
+        return []
+
+    lines = soup_text_lines(raw)
+
+    if not lines:
+        return []
+
+    # ✅ 목록 시작점 이후만 본다.
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if clean_text(line) in ("제목+본문", "TITLE+CONTENT"):
+            start_idx = i + 1
+            break
+
+    scan_lines = lines[start_idx:]
+    articles = []
+    seen = set()
+
+    for i, line in enumerate(scan_lines):
+        line = clean_text(line)
+        m = LIST_DATE_RE.search(line)
+
+        if not m:
+            continue
+
+        date = m.group(0).replace("-", ".").replace("/", ".")
+
+        # ✅ 날짜 바로 위쪽에서 카테고리 라인 찾기
+        cat_idx = -1
+        found_label = ""
+        found_kind = ""
+
+        for j in range(i - 1, max(-1, i - 8), -1):
+            t = clean_text(scan_lines[j])
+            mapped = LIST_CATEGORY_TO_KIND.get(t)
+
+            if mapped:
+                cat_idx = j
+                found_label = t
+                found_kind = mapped
+                break
+
+        if cat_idx < 0:
+            continue
+
+        if not _kind_matches_list_category(kind, found_kind):
+            continue
+
+        # ✅ 카테고리 위쪽에서 제목/설명 후보 수집
+        candidates = []
+
+        for j in range(cat_idx - 1, max(-1, cat_idx - 10), -1):
+            t = clean_text(scan_lines[j])
+
+            if not t:
+                continue
+
+            # 이전 글 영역으로 넘어가면 중단
+            if LIST_DATE_RE.search(t):
+                break
+
+            if t in LIST_CATEGORY_TO_KIND:
+                break
+
+            if t in ("제목+본문", "TITLE+CONTENT", "더 보기"):
+                break
+
+            if _is_list_noise_line(t):
+                continue
+
+            candidates.append(t)
+
+            if len(candidates) >= 3:
+                break
+
+        candidates.reverse()
+
+        if not candidates:
+            continue
+
+        title = candidates[0]
+        desc = candidates[1] if len(candidates) >= 2 else ""
+
+        # ✅ e스포츠 글은 공지성 목록에서 제외
+        target_text = f"{title} {desc} {found_label}".lower()
+        if kind in ("notice", "patch_notes", "labs", "dev_notes"):
+            if "esports" in target_text or "e스포츠" in target_text or "이스포츠" in target_text:
+                continue
+
+        article_id = _stable_list_article_id(kind, title, date)
+
+        if article_id in seen:
+            continue
+
+        seen.add(article_id)
+
+        articles.append({
+            "id": article_id,
+            "title": trim_text(title, 240),
+            "date": clean_text(date),
+            "category": kind,
+            "category_label": category_label(kind),
+            "url": page_url,
+            "description": trim_text(desc or "자세한 내용은 PUBG 공식 홈페이지에서 확인하세요.", 360),
+            "image_url": "",
+        })
+
+        if len(articles) >= limit:
+            break
+
+    print(
+        f"[INFO] list fallback parsed kind={kind} "
+        f"count={len(articles)} page={page_url}"
+    )
+
+    return articles[:limit]
+
 
 def get_latest_articles(kind: str, limit: int = 3) -> list[dict]:
     """
@@ -491,60 +703,90 @@ def get_latest_articles(kind: str, limit: int = 3) -> list[dict]:
       - patch_notes
       - labs
       - dev_notes
+
+    처리 순서:
+    1) 기존 방식: 목록 페이지에서 /ko/news/숫자 상세 URL 추출
+    2) 실패 시 fallback: 목록 페이지 텍스트에서 제목/날짜/카테고리 직접 추출
     """
     info = PUBG_KO_CATEGORY_URLS.get(kind) or PUBG_KO_CATEGORY_URLS["notice"]
     pages = list(info.get("urls") or [])
 
-    # ✅ event는 공식 페이지 구조가 바뀌는 경우가 있어서 넓게 검사
-    if kind == "event":
-        event_keywords = (
-            "이벤트",
-            "보상",
-            "미션",
-            "패스",
-            "event",
-            "reward",
-            "mission",
-            "pass",
-            "challenge",
-        )
-    else:
-        event_keywords = ()
-
-    urls = []
-
-    for page in pages:
-        for u in collect_article_urls_from_page(page, limit=24):
-            if u not in urls:
-                urls.append(u)
-
     articles = []
+    seen_ids = set()
 
-    for url in urls:
-        article = parse_article(url, forced_category=kind)
+    # ✅ 1차: 기존 상세 URL 파싱 방식
+    for page in pages:
+        urls = collect_article_urls_from_page(page, limit=24)
+        print(f"[INFO] detail url scan kind={kind} page={page} url_count={len(urls)}")
 
-        if not article:
-            continue
+        for url in urls:
+            article = parse_article(url, forced_category=kind)
 
-        title_l = article.get("title", "").lower()
-        desc_l = article.get("description", "").lower()
-        cat_l = article.get("category_label", "").lower()
-
-        # ✅ 이벤트는 이벤트성 글만 최대한 필터링
-        if kind == "event":
-            target = f"{title_l} {desc_l} {cat_l}"
-            if not any(k.lower() in target for k in event_keywords):
+            if not article:
                 continue
 
-        # ✅ e스포츠는 공지에서 제외
-        if kind in ("notice", "patch_notes", "labs", "dev_notes"):
-            if "esports" in title_l or "e스포츠" in title_l or "이스포츠" in title_l:
+            article_id = str(article.get("id") or "").strip()
+
+            if not article_id:
                 continue
 
-        articles.append(article)
+            if article_id in seen_ids:
+                continue
 
-        if len(articles) >= limit:
-            break
+            title_l = article.get("title", "").lower()
+            desc_l = article.get("description", "").lower()
+            cat_l = article.get("category_label", "").lower()
+
+            # ✅ 이벤트는 이벤트성 글만 최대한 필터링
+            if kind == "event":
+                target = f"{title_l} {desc_l} {cat_l}"
+                event_keywords = (
+                    "이벤트",
+                    "보상",
+                    "미션",
+                    "패스",
+                    "event",
+                    "reward",
+                    "mission",
+                    "pass",
+                    "challenge",
+                )
+
+                if not any(k.lower() in target for k in event_keywords):
+                    continue
+
+            # ✅ e스포츠는 공지에서 제외
+            if kind in ("notice", "patch_notes", "labs", "dev_notes"):
+                if "esports" in title_l or "e스포츠" in title_l or "이스포츠" in title_l:
+                    continue
+
+            seen_ids.add(article_id)
+            articles.append(article)
+
+            if len(articles) >= limit:
+                return articles[:limit]
+
+    # ✅ 2차: 상세 URL이 안 잡히는 경우 목록 텍스트 fallback
+    if not articles:
+        print(f"[INFO] detail url mode empty. fallback to list text parser kind={kind}")
+
+        for page in pages:
+            fallback_articles = collect_articles_from_list_page(page, kind, limit=limit)
+
+            for article in fallback_articles:
+                article_id = str(article.get("id") or "").strip()
+
+                if not article_id:
+                    continue
+
+                if article_id in seen_ids:
+                    continue
+
+                seen_ids.add(article_id)
+                articles.append(article)
+
+                if len(articles) >= limit:
+                    return articles[:limit]
 
     return articles[:limit]
 
