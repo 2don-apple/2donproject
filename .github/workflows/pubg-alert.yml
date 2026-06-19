@@ -40,16 +40,28 @@ jobs:
       - name: Send PUBG alerts
         env:
           PUBG_ALERT_CONFIG_JSON: ${{ secrets.PUBG_ALERT_CONFIG_JSON }}
-          PUBG_ALERT_TEST_MODE: ${{ github.event.inputs.test_mode }}
-          PUBG_ALERT_TEST_KINDS: ${{ github.event.inputs.test_kinds }}
+          PUBG_ALERT_TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+          PUBG_ALERT_TEST_KINDS: ${{ github.event.inputs.test_kinds || 'notice,patch_notes,labs,dev_notes,event,map_rotation' }}
+          PUBG_ALERT_TEST_WEBHOOK_URL: ${{ secrets.PUBG_ALERT_TEST_WEBHOOK_URL }}
         run: |
           python scripts/pubg_alert.py
 
       - name: Commit sent state
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.test_mode != 'true' }}
         run: |
+          if [ ! -f data/pubg_sent.json ]; then
+            echo "data/pubg_sent.json not found. Skip commit."
+            exit 0
+          fi
+
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add data/pubg_sent.json
-          git diff --cached --quiet || git commit -m "Update PUBG sent state"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update PUBG sent state"
           git push
