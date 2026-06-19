@@ -1098,9 +1098,270 @@ def enabled_types_from_config(guild_cfg: dict) -> dict:
 
     return result
 
+# =========================
+# 🧪 PUBG 알림 테스트 모드
+# - 실제 웹훅으로 발송
+# - pubg_sent.json 중복 발송 기록은 건드리지 않음
+# - 각 카테고리 최신글 1개씩 테스트 발송
+# =========================
+def env_bool(name: str, default: bool = False) -> bool:
+    v = str(os.getenv(name, "")).strip().lower()
+
+    if not v:
+        return default
+
+    return v in ("1", "true", "yes", "y", "on", "enable", "enabled", "테스트", "켜기")
+
+
+def env_csv(name: str, default: list[str]) -> list[str]:
+    raw = str(os.getenv(name, "")).strip()
+
+    if not raw:
+        return list(default)
+
+    return [
+        x.strip()
+        for x in raw.split(",")
+        if x.strip()
+    ]
+
+
+def get_test_guild_cfg(config: dict) -> tuple[str, dict]:
+    """
+    테스트에 사용할 guild 설정 선택.
+
+    우선순위:
+    1) PUBG_ALERT_TEST_WEBHOOK_URL 직접 지정
+    2) PUBG_ALERT_TEST_GUILD_ID에 해당하는 guild
+    3) enabled=True 이고 webhook_url 있는 첫 guild
+    4) webhook_url 있는 첫 guild
+    """
+    direct_webhook = str(os.getenv("PUBG_ALERT_TEST_WEBHOOK_URL", "")).strip()
+
+    if direct_webhook:
+        return "TEST_WEBHOOK", {
+            "enabled": True,
+            "webhook_url": direct_webhook,
+            "platform": "steam",
+            "device": "pc",
+            "server_region": "as",
+            "types": {
+                "map_rotation": True,
+                "notice": True,
+                "event": True,
+                "patch_notes": True,
+                "labs": True,
+                "dev_notes": True,
+            },
+        }
+
+    guilds = config.get("guilds") or {}
+    test_gid = str(os.getenv("PUBG_ALERT_TEST_GUILD_ID", "")).strip()
+
+    if test_gid:
+        cfg = guilds.get(test_gid)
+
+        if isinstance(cfg, dict) and str(cfg.get("webhook_url") or "").strip():
+            return test_gid, cfg
+
+        raise RuntimeError(
+            f"PUBG_ALERT_TEST_GUILD_ID={test_gid} 서버 설정을 찾지 못했거나 webhook_url이 없습니다."
+        )
+
+    for gid, cfg in guilds.items():
+        if not isinstance(cfg, dict):
+            continue
+
+        if cfg.get("enabled") and str(cfg.get("webhook_url") or "").strip():
+            return str(gid), cfg
+
+    for gid, cfg in guilds.items():
+        if not isinstance(cfg, dict):
+            continue
+
+        if str(cfg.get("webhook_url") or "").strip():
+            return str(gid), cfg
+
+    raise RuntimeError(
+        "테스트에 사용할 webhook_url을 찾지 못했습니다. "
+        "PUBG_ALERT_TEST_WEBHOOK_URL을 지정하거나 PUBG_ALERT_CONFIG_JSON을 확인하세요."
+    )
+
+
+def build_test_empty_embed(kind: str, reason: str) -> dict:
+    label = category_label(kind)
+    emoji = category_emoji(kind)
+
+    return {
+        "color": PUBG_COLOR_NOTICE,
+        "author": {
+            "name": "PUBG: BATTLEGROUNDS",
+            "url": PUBG_HOME,
+        },
+        "title": f"🧪 PUBG 알림 테스트 · {emoji} {label}",
+        "description": (
+            f"카테고리 `{kind}` 테스트 중 최신글을 찾지 못했습니다.\n\n"
+            f"사유: {reason}"
+        ),
+        "fields": [
+            {
+                "name": "테스트 결과",
+                "value": "최신글 없음 / 파싱 실패 / 필터링 제외",
+                "inline": False,
+            },
+            {
+                "name": "중복 기록",
+                "value": "테스트 모드이므로 pubg_sent.json에 저장하지 않음",
+                "inline": False,
+            },
+        ],
+        "footer": embed_footer(),
+        "timestamp": now_kst().isoformat(),
+    }
+
+
+def send_test_article_for_kind(webhook_url: str, kind: str):
+    """
+    특정 카테고리 최신글 1개를 테스트 발송.
+    실제 알림과 같은 build_article_embed()를 사용한다.
+    """
+    articles = get_latest_articles(kind, limit=1)
+
+    if not articles:
+        embed = build_test_empty_embed(kind, "get_latest_articles() 결과가 비어있습니다.")
+        discord_post(
+            webhook_url,
+            content=f"🧪 PUBG 알림 테스트 · `{kind}`",
+            embed=embed,
+        )
+        print(f"[TEST][EMPTY] kind={kind}")
+        return
+
+    article = articles[0]
+
+    # ✅ forced_category가 누락된 경우 대비
+    article["category"] = article.get("category") or kind
+    article["category_label"] = article.get("category_label") or category_label(kind)
+
+    embed = build_article_embed(article, kind)
+
+    # ✅ 테스트임을 명확히 표시
+    embed.setdefault("fields", [])
+    embed["fields"].insert(
+        0,
+        {
+            "name": "🧪 테스트 발송",
+            "value": (
+                "각 카테고리 최신글 1개 테스트입니다.\n"
+                "`pubg_sent.json` 중복 발송 기록에는 저장하지 않습니다."
+            ),
+            "inline": False,
+        }
+    )
+
+    discord_post(
+        webhook_url,
+        content=f"🧪 PUBG 알림 테스트 · `{kind}`",
+        embed=embed,
+    )
+
+    print(
+        f"[TEST][SENT] kind={kind} "
+        f"id={article.get('id')} title={article.get('title')}"
+    )
+
+
+def send_test_map_rotation(webhook_url: str, guild_cfg: dict):
+    data = get_current_map_rotation(guild_cfg)
+    embed = build_map_rotation_embed(data)
+
+    embed.setdefault("fields", [])
+    embed["fields"].insert(
+        0,
+        {
+            "name": "🧪 테스트 발송",
+            "value": (
+                "맵 로테이션 테스트입니다.\n"
+                "`pubg_sent.json` 중복 발송 기록에는 저장하지 않습니다."
+            ),
+            "inline": False,
+        }
+    )
+
+    discord_post(
+        webhook_url,
+        content="🧪 PUBG 알림 테스트 · `map_rotation`",
+        embed=embed,
+    )
+
+    print(
+        f"[TEST][SENT] kind=map_rotation "
+        f"week={data.get('week')} fallback={data.get('fallback')}"
+    )
+
+
+def run_test_mode(config: dict):
+    gid, guild_cfg = get_test_guild_cfg(config)
+    webhook_url = str(guild_cfg.get("webhook_url") or "").strip()
+
+    if not webhook_url:
+        raise RuntimeError("테스트용 webhook_url이 비어있습니다.")
+
+    # ✅ 테스트할 카테고리
+    # 기본값: 공지사항 묶음 4개 + 이벤트 + 맵로테이션
+    test_kinds = env_csv(
+        "PUBG_ALERT_TEST_KINDS",
+        ["notice", "patch_notes", "labs", "dev_notes", "event", "map_rotation"]
+    )
+
+    # ✅ Steam / PC / AS 서버 기준 강제
+    guild_cfg["platform"] = "steam"
+    guild_cfg["device"] = "pc"
+    guild_cfg["server_region"] = "as"
+
+    print(f"[TEST] PUBG alert test mode started gid={gid} kinds={test_kinds}")
+
+    for kind in test_kinds:
+        kind = str(kind or "").strip()
+
+        if not kind:
+            continue
+
+        try:
+            if kind == "map_rotation":
+                send_test_map_rotation(webhook_url, guild_cfg)
+            else:
+                send_test_article_for_kind(webhook_url, kind)
+
+        except Exception as e:
+            print(f"[TEST][ERROR] kind={kind} err={type(e).__name__}: {e}")
+
+            try:
+                embed = build_test_empty_embed(kind, f"{type(e).__name__}: {e}")
+                discord_post(
+                    webhook_url,
+                    content=f"🧪 PUBG 알림 테스트 실패 · `{kind}`",
+                    embed=embed,
+                )
+            except Exception as send_e:
+                print(
+                    f"[TEST][ERROR] failed to send error embed "
+                    f"kind={kind} err={type(send_e).__name__}: {send_e}"
+                )
+
+    print("[TEST] PUBG alert test mode finished")
+
 
 def main():
     config = load_config()
+
+    # ✅ 테스트 모드
+    # - 실제 웹훅으로 발송
+    # - state/pubg_sent.json 저장 안 함
+    if env_bool("PUBG_ALERT_TEST_MODE", False):
+        run_test_mode(config)
+        return
+
     state = load_state()
 
     guilds = config.get("guilds") or {}
