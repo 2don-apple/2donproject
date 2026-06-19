@@ -37,6 +37,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
+      - name: Debug PUBG config summary
+        env:
+          PUBG_ALERT_CONFIG_JSON: ${{ secrets.PUBG_ALERT_CONFIG_JSON }}
+        run: |
+          python - <<'PY'
+          import os, json
+
+          raw = os.getenv("PUBG_ALERT_CONFIG_JSON", "")
+          print("PUBG_ALERT_CONFIG_JSON length:", len(raw))
+
+          if not raw.strip():
+              print("CONFIG IS EMPTY")
+              raise SystemExit(0)
+
+          try:
+              data = json.loads(raw)
+          except Exception as e:
+              print("CONFIG JSON ERROR:", type(e).__name__, e)
+              raise SystemExit(0)
+
+          guilds = data.get("guilds") or {}
+          print("guild count:", len(guilds))
+
+          for gid, cfg in guilds.items():
+              if not isinstance(cfg, dict):
+                  print(f"guild={gid} cfg=NOT_DICT")
+                  continue
+
+              webhook = str(cfg.get("webhook_url") or "").strip()
+              print(
+                  f"guild={gid} "
+                  f"enabled={cfg.get('enabled')} "
+                  f"webhook={'YES' if webhook.startswith('https://') else 'NO'} "
+                  f"channel_id={cfg.get('channel_id')} "
+                  f"channel_name={cfg.get('channel_name')} "
+                  f"types={cfg.get('types')}"
+              )
+          PY
+
       - name: Send PUBG alerts
         env:
           PUBG_ALERT_CONFIG_JSON: ${{ secrets.PUBG_ALERT_CONFIG_JSON }}
