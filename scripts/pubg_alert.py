@@ -491,6 +491,14 @@ def discord_post(webhook_url: str, content: str):
     r = requests.post(
         webhook_url,
         json={
+            # ✅ 웹훅 표시 이름
+            "username": "PUBG 알림",
+
+            # ✅ 웹훅 프로필 이미지
+            # 반드시 외부에서 접근 가능한 이미지 URL이어야 함
+            # 예: GitHub raw 이미지 URL, Discord CDN 이미지 URL 등
+            "avatar_url": "https://raw.githubusercontent.com/2don-apple/2donproject/main/assets/pubg_alert_icon.png",
+
             "content": content,
             "allowed_mentions": {"parse": []},
         },
