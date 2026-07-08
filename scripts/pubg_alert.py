@@ -185,8 +185,6 @@ PUBG_COLOR_MAP = 0x2ECC71
 # ✅ 웹훅 프로필 이미지
 PUBG_ALERT_AVATAR_URL = "https://raw.githubusercontent.com/2don-apple/2donproject/main/pubg_alert_icon.png?v=20260620_1"
 
-KST = timezone(timedelta(hours=9))
-
 MAP_KO = {
     "Erangel": "에란겔",
     "Taego": "태이고",
