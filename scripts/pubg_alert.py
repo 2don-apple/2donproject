@@ -9,6 +9,115 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
+KST = timezone(timedelta(hours=9))
+
+
+def _parse_date_yyyy_mm_dd(value: str):
+    value = str(value or "").strip()
+    if not value:
+        return None
+
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _parse_post_date_to_date(value: str):
+    """
+    PUBG 게시글 날짜를 date로 변환.
+    지원 예:
+    - 2026-06-28
+    - 2026.06.28
+    - 2026/06/28
+    - 2026-06-28T01:23:45Z
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+
+    s = s.replace(".", "-").replace("/", "-")
+
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _parse_datetime_iso(value: str):
+    """
+    ISO datetime 변환.
+    지원 예:
+    - 2026-07-08T01:23:45Z
+    - 2026-07-08T01:23:45+00:00
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _is_after_guild_enabled_time(item: dict, guild_cfg: dict) -> bool:
+    """
+    서버가 PUBG 알림을 켠 이후 게시글만 허용.
+
+    우선순위:
+    1) 게시글에 published_at 같은 정확한 시간이 있고, enabled_since도 있으면 시간 기준 비교
+    2) 시간이 없으면 enabled_since_date 기준으로 날짜 비교
+    3) 게시글 날짜를 전혀 못 읽으면 신규 서버 과거글 폭탄 방지를 위해 False
+    """
+    if not isinstance(item, dict):
+        return False
+
+    if not isinstance(guild_cfg, dict):
+        return True
+
+    enabled_dt = _parse_datetime_iso(guild_cfg.get("enabled_since"))
+    enabled_date = _parse_date_yyyy_mm_dd(guild_cfg.get("enabled_since_date"))
+
+    # 기준값이 아예 없으면 구버전 호환으로 허용
+    if not enabled_dt and not enabled_date:
+        return True
+
+    # 1) 정확한 게시 시각 비교
+    post_dt = (
+        _parse_datetime_iso(item.get("published_at"))
+        or _parse_datetime_iso(item.get("published"))
+        or _parse_datetime_iso(item.get("posted_at"))
+        or _parse_datetime_iso(item.get("created_at"))
+    )
+
+    if enabled_dt and post_dt:
+        try:
+            if post_dt.tzinfo is None:
+                post_dt = post_dt.replace(tzinfo=timezone.utc)
+            if enabled_dt.tzinfo is None:
+                enabled_dt = enabled_dt.replace(tzinfo=timezone.utc)
+            return post_dt >= enabled_dt
+        except Exception:
+            pass
+
+    # 2) 날짜 비교 fallback
+    post_date = (
+        _parse_post_date_to_date(item.get("published_date"))
+        or _parse_post_date_to_date(item.get("date"))
+        or _parse_post_date_to_date(item.get("published_at"))
+        or _parse_post_date_to_date(item.get("posted_at"))
+        or _parse_post_date_to_date(item.get("created_at"))
+    )
+
+    if enabled_date and post_date:
+        return post_date >= enabled_date
+
+    # 3) 날짜를 못 읽으면 신규 서버 과거글 폭탄 방지 우선
+    return False
+
 
 CONFIG_SECRET_NAME = "PUBG_ALERT_CONFIG_JSON"
 CONFIG_JSON = os.getenv(CONFIG_SECRET_NAME, "").strip()
@@ -1284,6 +1393,25 @@ def build_article_embed(article: dict, kind: str) -> dict:
 def send_map_rotation_for_guild(gid: str, guild_cfg: dict, state: dict):
     data = get_current_map_rotation(guild_cfg)
 
+    # ✅ 맵 로테이션도 알림 시작일 이전 주차면 최초 발송하지 않음
+    enabled_date = _parse_date_yyyy_mm_dd(guild_cfg.get("enabled_since_date"))
+
+    if enabled_date:
+        try:
+            rotation_end_date = data["end"].astimezone(KST).date()
+
+            # 이번 로테이션 기간이 알림 시작일보다 완전히 이전이면 스킵
+            if rotation_end_date < enabled_date:
+                print(
+                    "[SKIP] map before guild enabled date "
+                    f"gid={gid} "
+                    f"enabled_since_date={guild_cfg.get('enabled_since_date')} "
+                    f"rotation={format_date(data['start'])}~{format_date(data['end'])}"
+                )
+                return
+        except Exception as e:
+            print(f"[WARN] map enabled date filter failed gid={gid} err={type(e).__name__}: {e}")
+
     key = f"{gid}:map_rotation:{format_date(data['start'])}:{format_date(data['end'])}"
 
     if not should_send(state, key):
@@ -1342,6 +1470,22 @@ def send_articles_for_guild(gid: str, guild_cfg: dict, kind: str, state: dict):
         article_id = str(article.get("id") or "").strip()
 
         if not article_id:
+            continue
+
+        # ✅ 알림을 켠 날짜/시간 이전 글은 발송하지 않음
+        # - 신규 서버 최초 설정 시 과거 글이 한꺼번에 발송되는 문제 방지
+        # - OFF 후 다시 ON 하면 다시 켠 날짜/시간 기준으로 필터링됨
+        if not _is_after_guild_enabled_time(article, guild_cfg):
+            print(
+                "[SKIP] before guild enabled time "
+                f"gid={gid} "
+                f"kind={kind} "
+                f"enabled_since={guild_cfg.get('enabled_since')} "
+                f"enabled_since_date={guild_cfg.get('enabled_since_date')} "
+                f"article_date={article.get('date')} "
+                f"id={article_id} "
+                f"title={article.get('title')}"
+            )
             continue
 
         # ✅ 공지사항 그룹(notice/patch_notes/labs/dev_notes)은 하나로 묶어서 중복 방지
@@ -1428,6 +1572,8 @@ def _normalize_guild_cfg_for_alert(cfg: dict) -> dict:
        {
          "enabled": true,
          "webhook_url": "...",
+         "enabled_since": "2026-07-08T09:00:00Z",
+         "enabled_since_date": "2026-07-08",
          "types": {...}
        }
 
@@ -1436,6 +1582,8 @@ def _normalize_guild_cfg_for_alert(cfg: dict) -> dict:
          "pubg_alert": {
            "enabled": true,
            "webhook_url": "...",
+           "enabled_since": "2026-07-08T09:00:00Z",
+           "enabled_since_date": "2026-07-08",
            "types": {...}
          }
        }
@@ -1467,12 +1615,31 @@ def _normalize_guild_cfg_for_alert(cfg: dict) -> dict:
     if not channel_name:
         channel_name = pa.get("channel_name")
 
+    enabled_since = str(
+        cfg.get("enabled_since")
+        or pa.get("enabled_since")
+        or ""
+    ).strip()
+
+    enabled_since_date = str(
+        cfg.get("enabled_since_date")
+        or pa.get("enabled_since_date")
+        or ""
+    ).strip()
+
     normalized = dict(cfg)
 
     normalized["enabled"] = bool(enabled)
     normalized["webhook_url"] = webhook_url
     normalized["channel_id"] = channel_id
     normalized["channel_name"] = str(channel_name or "")
+
+    # ✅ 알림 시작 기준
+    # - 신규 서버가 과거 공지를 최초 1회 발송하지 않도록 사용
+    # - OFF 후 다시 ON 하면 봇 코드에서 새 값으로 갱신되어 들어온다.
+    normalized["enabled_since"] = enabled_since
+    normalized["enabled_since_date"] = enabled_since_date
+
     normalized["types"] = {
         "map_rotation": bool(types.get("map_rotation")),
         "notice": bool(types.get("notice")),
@@ -1494,7 +1661,7 @@ def _normalize_guild_cfg_for_alert(cfg: dict) -> dict:
     normalized["ranked_maps"] = (
         normalized.get("ranked_maps")
         or pa.get("ranked_maps")
-        or ["에란겔", "태이고", "미라마", "론도"]
+        or ["에란겔", "미라마", "태이고", "론도"]
     )
     normalized["map_report_url"] = (
         normalized.get("map_report_url")
@@ -1801,6 +1968,8 @@ def main():
             f"[CONFIG] gid={gid} "
             f"enabled={guild_cfg.get('enabled')} "
             f"webhook={_mask_webhook_for_log(webhook_url)} "
+            f"enabled_since={guild_cfg.get('enabled_since')} "
+            f"enabled_since_date={guild_cfg.get('enabled_since_date')} "
             f"types={guild_cfg.get('types')}"
         )
 
