@@ -897,6 +897,24 @@ def get_latest_articles(kind: str, limit: int = 3) -> list[dict]:
 
     return articles[:limit]
 
+def is_map_service_report_article(article: dict) -> bool:
+    """
+    PUBG 공지글이 맵 서비스 리포트인지 판별한다.
+    """
+    if not isinstance(article, dict):
+        return False
+
+    title = clean_text(article.get("title")).lower()
+    desc = clean_text(article.get("description")).lower()
+    target = f"{title} {desc}"
+
+    keywords = (
+        "맵 서비스 리포트",
+        "map service report",
+    )
+
+    return any(keyword in target for keyword in keywords)
+
 
 def find_latest_map_report_url() -> str:
     candidates = []
@@ -1130,39 +1148,57 @@ def parse_month_day(s: str, year: int) -> datetime:
     raise ValueError(f"날짜 파싱 실패: {s}")
 
 
-def current_week_from_schedule(schedule: list[dict], ref: datetime) -> tuple[int, datetime, datetime] | None:
+def current_week_from_schedule(
+    schedule: list[dict],
+    ref: datetime
+) -> tuple[int, datetime, datetime] | None:
+    """
+    현재 날짜가 실제로 포함된 주차만 반환한다.
+
+    기존 코드처럼 현재 날짜에 해당하는 주차가 없어도
+    첫 번째 주차를 반환하지 않는다.
+    """
     if not schedule:
         return None
 
-    year = ref.year
     starts = []
 
     for item in schedule:
         try:
-            start = parse_month_day(item["pc_date"], year)
-        except Exception:
+            start = parse_month_day(item["pc_date"], ref.year)
+        except Exception as e:
+            print(
+                f"[WARN] map schedule date parse failed "
+                f"week={item.get('week')} "
+                f"date={item.get('pc_date')} "
+                f"err={type(e).__name__}: {e}"
+            )
             continue
 
-        starts.append((item["week"], start))
+        starts.append((int(item["week"]), start))
 
     starts.sort(key=lambda x: x[1])
 
     if not starts:
         return None
 
-    chosen = starts[0]
-    end = starts[1][1] if len(starts) >= 2 else starts[0][1] + timedelta(days=7)
-
-    for idx, pair in enumerate(starts):
-        week, start = pair
-        next_start = starts[idx + 1][1] if idx + 1 < len(starts) else start + timedelta(days=7)
+    for idx, (week, start) in enumerate(starts):
+        next_start = (
+            starts[idx + 1][1]
+            if idx + 1 < len(starts)
+            else start + timedelta(days=7)
+        )
 
         if start.date() <= ref.date() < next_start.date():
-            chosen = pair
-            end = next_start
-            break
+            return week, start, next_start
 
-    return chosen[0], chosen[1], end
+    print(
+        "[WARN] current date not found in map schedule "
+        f"today={ref.astimezone(KST).date()} "
+        f"schedule={[(week, start.date()) for week, start in starts]}"
+    )
+
+    return None
 
 
 def fallback_map_rotation(guild_cfg: dict) -> dict:
@@ -1388,40 +1424,121 @@ def build_article_embed(article: dict, kind: str) -> dict:
     return embed
 
 
-def send_map_rotation_for_guild(gid: str, guild_cfg: dict, state: dict):
-    data = get_current_map_rotation(guild_cfg)
+def send_map_rotation_for_guild(
+    gid: str,
+    guild_cfg: dict,
+    state: dict,
+    report_article: dict | None = None,
+):
+    """
+    맵 로테이션 카드 발송.
 
-    # ✅ 맵 로테이션도 알림 시작일 이전 주차면 최초 발송하지 않음
-    enabled_date = _parse_date_yyyy_mm_dd(guild_cfg.get("enabled_since_date"))
+    report_article이 전달되면:
+    - 새로 발견한 맵 서비스 리포트 URL을 직접 사용
+    - 해당 리포트 ID를 중복 방지 키에 포함
+    """
+    work_cfg = dict(guild_cfg or {})
+
+    report_id = ""
+    report_url = ""
+
+    if isinstance(report_article, dict):
+        report_id = str(report_article.get("id") or "").strip()
+        report_url = str(report_article.get("url") or "").strip()
+
+        if report_url:
+            work_cfg["map_report_url"] = report_url
+
+            print(
+                f"[INFO] use detected map service report "
+                f"gid={gid} "
+                f"report_id={report_id} "
+                f"url={report_url}"
+            )
+
+    data = get_current_map_rotation(work_cfg)
+
+    enabled_date = _parse_date_yyyy_mm_dd(
+        guild_cfg.get("enabled_since_date")
+    )
 
     if enabled_date:
         try:
             rotation_end_date = data["end"].astimezone(KST).date()
 
-            # 이번 로테이션 기간이 알림 시작일보다 완전히 이전이면 스킵
             if rotation_end_date < enabled_date:
                 print(
                     "[SKIP] map before guild enabled date "
                     f"gid={gid} "
                     f"enabled_since_date={guild_cfg.get('enabled_since_date')} "
-                    f"rotation={format_date(data['start'])}~{format_date(data['end'])}"
+                    f"rotation={format_date(data['start'])}"
+                    f"~{format_date(data['end'])}"
                 )
-                return
-        except Exception as e:
-            print(f"[WARN] map enabled date filter failed gid={gid} err={type(e).__name__}: {e}")
+                return False
 
-    key = f"{gid}:map_rotation:{format_date(data['start'])}:{format_date(data['end'])}"
+        except Exception as e:
+            print(
+                f"[WARN] map enabled date filter failed "
+                f"gid={gid} err={type(e).__name__}: {e}"
+            )
+
+    start_text = format_date(data["start"])
+    end_text = format_date(data["end"])
+
+    # 새 맵 서비스 리포트에서 실행된 경우 리포트 ID까지 키에 포함한다.
+    # 동일 리포트의 중복 발송은 막고, 새 리포트는 다시 발송한다.
+    if report_id:
+        key = (
+            f"{gid}:map_rotation:"
+            f"report:{report_id}:"
+            f"{start_text}:{end_text}"
+        )
+    else:
+        key = (
+            f"{gid}:map_rotation:"
+            f"{start_text}:{end_text}"
+        )
 
     if not should_send(state, key):
-        print(f"[SKIP] map already sent gid={gid} key={key}")
-        return
+        print(
+            f"[SKIP] map already sent "
+            f"gid={gid} key={key}"
+        )
+        return False
 
     embed = build_map_rotation_embed(data)
 
-    discord_post(guild_cfg["webhook_url"], embed=embed)
+    if report_id:
+        embed.setdefault("fields", [])
+        embed["fields"].insert(
+            0,
+            {
+                "name": "맵 서비스 리포트",
+                "value": (
+                    f"[업데이트된 공식 리포트 확인]"
+                    f"({report_url or data.get('source_url')})"
+                ),
+                "inline": False,
+            }
+        )
+
+    discord_post(
+        guild_cfg["webhook_url"],
+        embed=embed,
+    )
+
     mark_sent(state, key)
 
-    print(f"[SENT] map rotation gid={gid} week={data['week']} fallback={data['fallback']}")
+    print(
+        f"[SENT] map rotation "
+        f"gid={gid} "
+        f"week={data.get('week')} "
+        f"fallback={data.get('fallback')} "
+        f"report_id={report_id or '-'} "
+        f"period={start_text}~{end_text}"
+    )
+
+    return True
 
 
 def article_state_keys(gid: str, kind: str, article_id: str) -> list[str]:
@@ -1455,14 +1572,27 @@ def mark_article_sent(state: dict, gid: str, kind: str, article_id: str):
         state[key] = sent_at
 
 
-def send_articles_for_guild(gid: str, guild_cfg: dict, kind: str, state: dict):
+def send_articles_for_guild(
+    gid: str,
+    guild_cfg: dict,
+    kind: str,
+    state: dict
+) -> list[dict]:
+    """
+    최신 게시글을 발송하고,
+    이번 실행에서 새로 발송한 맵 서비스 리포트 목록을 반환한다.
+    """
     articles = get_latest_articles(kind, limit=3)
 
     label = category_label(kind)
+    sent_map_reports = []
 
     if not articles:
-        print(f"[INFO] no articles found gid={gid} kind={kind} label={label}")
-        return
+        print(
+            f"[INFO] no articles found "
+            f"gid={gid} kind={kind} label={label}"
+        )
+        return sent_map_reports
 
     for article in articles:
         article_id = str(article.get("id") or "").strip()
@@ -1470,9 +1600,6 @@ def send_articles_for_guild(gid: str, guild_cfg: dict, kind: str, state: dict):
         if not article_id:
             continue
 
-        # ✅ 알림을 켠 날짜/시간 이전 글은 발송하지 않음
-        # - 신규 서버 최초 설정 시 과거 글이 한꺼번에 발송되는 문제 방지
-        # - OFF 후 다시 ON 하면 다시 켠 날짜/시간 기준으로 필터링됨
         if not _is_after_guild_enabled_time(article, guild_cfg):
             print(
                 "[SKIP] before guild enabled time "
@@ -1486,23 +1613,51 @@ def send_articles_for_guild(gid: str, guild_cfg: dict, kind: str, state: dict):
             )
             continue
 
-        # ✅ 공지사항 그룹(notice/patch_notes/labs/dev_notes)은 하나로 묶어서 중복 방지
         if article_already_sent(state, gid, kind, article_id):
-            print(f"[SKIP] {kind} already sent gid={gid} id={article_id}")
+            print(
+                f"[SKIP] {kind} already sent "
+                f"gid={gid} id={article_id}"
+            )
             continue
 
         embed = build_article_embed(article, kind)
 
-        discord_post(guild_cfg["webhook_url"], embed=embed)
-        mark_article_sent(state, gid, kind, article_id)
+        discord_post(
+            guild_cfg["webhook_url"],
+            embed=embed,
+        )
+
+        mark_article_sent(
+            state,
+            gid,
+            kind,
+            article_id,
+        )
 
         primary = primary_category_label(kind)
         secondary = secondary_category_hashtag(kind)
 
         print(
-            f"[SENT] {primary} {secondary} gid={gid} "
-            f"id={article_id} title={article.get('title')}"
+            f"[SENT] {primary} {secondary} "
+            f"gid={gid} "
+            f"id={article_id} "
+            f"title={article.get('title')}"
         )
+
+        # 새로 발송한 공지가 맵 서비스 리포트라면
+        # 맵 로테이션 카드 발송 대상으로 반환한다.
+        if is_map_service_report_article(article):
+            sent_map_reports.append(dict(article))
+
+            print(
+                f"[INFO] new map service report detected "
+                f"gid={gid} "
+                f"id={article_id} "
+                f"title={article.get('title')} "
+                f"url={article.get('url')}"
+            )
+
+    return sent_map_reports
 
 
 def enabled_types_from_config(guild_cfg: dict) -> dict:
@@ -1661,11 +1816,13 @@ def _normalize_guild_cfg_for_alert(cfg: dict) -> dict:
         or pa.get("ranked_maps")
         or ["에란겔", "미라마", "태이고", "론도"]
     )
-    normalized["map_report_url"] = (
+    # 특정 리포트 URL이 설정된 경우에만 사용한다.
+    # 값이 없으면 get_current_map_rotation()에서 최신 리포트를 검색한다.
+    normalized["map_report_url"] = str(
         normalized.get("map_report_url")
         or pa.get("map_report_url")
-        or PUBG_MAP_REPORT_FALLBACK_URL
-    )
+        or ""
+    ).strip()
 
     return normalized
 
@@ -1984,28 +2141,94 @@ def main():
 
         types = enabled_types_from_config(guild_cfg)
 
-        if types.get("map_rotation"):
-            send_map_rotation_for_guild(str(gid), guild_cfg, state)
+        new_map_reports = []
 
-        # ✅ 공지사항: notice
+        # 공지사항을 먼저 확인한다.
+        # 새 맵 서비스 리포트가 있으면 그 URL로 맵 카드를 생성한다.
         if types.get("notice"):
-            send_articles_for_guild(str(gid), guild_cfg, "notice", state)
+            new_map_reports.extend(
+                send_articles_for_guild(
+                    str(gid),
+                    guild_cfg,
+                    "notice",
+                    state,
+                )
+            )
 
-        # ✅ 패치노트: patch_notes
         if types.get("patch_notes"):
-            send_articles_for_guild(str(gid), guild_cfg, "patch_notes", state)
+            new_map_reports.extend(
+                send_articles_for_guild(
+                    str(gid),
+                    guild_cfg,
+                    "patch_notes",
+                    state,
+                )
+            )
 
-        # ✅ LABS: labs
         if types.get("labs"):
-            send_articles_for_guild(str(gid), guild_cfg, "labs", state)
+            new_map_reports.extend(
+                send_articles_for_guild(
+                    str(gid),
+                    guild_cfg,
+                    "labs",
+                    state,
+                )
+            )
 
-        # ✅ 개발일지: dev_notes
         if types.get("dev_notes"):
-            send_articles_for_guild(str(gid), guild_cfg, "dev_notes", state)
+            new_map_reports.extend(
+                send_articles_for_guild(
+                    str(gid),
+                    guild_cfg,
+                    "dev_notes",
+                    state,
+                )
+            )
 
-        # ✅ 기존 이벤트 설정 호환
         if types.get("event"):
-            send_articles_for_guild(str(gid), guild_cfg, "event", state)
+            send_articles_for_guild(
+                str(gid),
+                guild_cfg,
+                "event",
+                state,
+            )
+
+        # 맵 로테이션 알림이 켜져 있을 때만 맵 목록 카드를 보낸다.
+        if types.get("map_rotation"):
+            if new_map_reports:
+                # 같은 실행에서 여러 목록에 중복 검출될 가능성에 대비
+                unique_reports = []
+                seen_report_ids = set()
+
+                for article in new_map_reports:
+                    report_id = str(article.get("id") or "").strip()
+                    report_url = str(article.get("url") or "").strip()
+                    dedupe_key = report_id or report_url
+
+                    if not dedupe_key:
+                        continue
+
+                    if dedupe_key in seen_report_ids:
+                        continue
+
+                    seen_report_ids.add(dedupe_key)
+                    unique_reports.append(article)
+
+                # 가장 먼저 발견된 최신 리포트 하나만 사용
+                send_map_rotation_for_guild(
+                    str(gid),
+                    guild_cfg,
+                    state,
+                    report_article=unique_reports[0],
+                )
+
+            else:
+                # 새 리포트가 없는 날에도 현재 주차 카드가 누락되었으면 발송
+                send_map_rotation_for_guild(
+                    str(gid),
+                    guild_cfg,
+                    state,
+                )
 
     save_state(state)
 
