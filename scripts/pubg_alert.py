@@ -1202,11 +1202,41 @@ def current_week_from_schedule(
 
 
 def fallback_map_rotation(guild_cfg: dict) -> dict:
-    normal = guild_cfg.get("normal_maps") or guild_cfg.get("map_rotation") or ["에란겔", "태이고", "미라마", "사녹", "비켄디"]
-    ranked = guild_cfg.get("ranked_maps") or ["에란겔", "미라마", "태이고", "론도"]
+    """
+    공식 맵 서비스 리포트 파싱 실패 시 사용하는 fallback.
+
+    PUBG PC 맵 로테이션 주기:
+    - 시작: 수요일
+    - 종료: 다음 주 화요일
+    - 내부 end 값은 다음 수요일 00:00의 배타적 종료 경계로 저장
+    """
+    normal = (
+        guild_cfg.get("normal_maps")
+        or guild_cfg.get("map_rotation")
+        or ["에란겔", "태이고", "미라마", "사녹", "비켄디"]
+    )
+
+    ranked = (
+        guild_cfg.get("ranked_maps")
+        or ["에란겔", "미라마", "태이고", "론도"]
+    )
 
     today = now_kst()
-    start = today - timedelta(days=today.weekday())
+
+    # Python weekday:
+    # 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6
+    #
+    # 오늘을 기준으로 가장 최근 수요일을 찾는다.
+    days_since_wednesday = (today.weekday() - 2) % 7
+
+    start = (today - timedelta(days=days_since_wednesday)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    # 내부 종료 경계는 다음 수요일 00:00
     end = start + timedelta(days=7)
 
     return {
@@ -1215,7 +1245,10 @@ def fallback_map_rotation(guild_cfg: dict) -> dict:
         "end": end,
         "normal": normal,
         "ranked": ranked,
-        "source_url": guild_cfg.get("map_report_url") or PUBG_MAP_REPORT_FALLBACK_URL,
+        "source_url": (
+            guild_cfg.get("map_report_url")
+            or PUBG_MAP_REPORT_FALLBACK_URL
+        ),
         "fallback": True,
     }
 
@@ -1262,6 +1295,16 @@ def get_current_map_rotation(guild_cfg: dict) -> dict:
 
 def format_date(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y.%m.%d")
+
+def format_rotation_end_date(end_dt: datetime) -> str:
+    """
+    내부 end는 다음 주차 시작 시각인 수요일 00:00이다.
+
+    Discord에는 실제 적용 마지막 날인
+    전날 화요일까지 표시한다.
+    """
+    display_end = end_dt.astimezone(KST) - timedelta(days=1)
+    return display_end.strftime("%Y.%m.%d")
 
 
 def embed_footer() -> dict:
@@ -1330,7 +1373,10 @@ def build_map_rotation_embed(data: dict) -> dict:
             },
             {
                 "name": "기간",
-                "value": f"{format_date(data['start'])} ~ {format_date(data['end'])}",
+                "value": (
+                    f"{format_date(data['start'])} "
+                    f"~ {format_rotation_end_date(data['end'])}"
+                ),
                 "inline": True,
             },
             {
@@ -1464,7 +1510,9 @@ def send_map_rotation_for_guild(
 
     if enabled_date:
         try:
-            rotation_end_date = data["end"].astimezone(KST).date()
+            rotation_end_date = (
+                data["end"].astimezone(KST) - timedelta(days=1)
+            ).date()
 
             if rotation_end_date < enabled_date:
                 print(
@@ -1535,7 +1583,7 @@ def send_map_rotation_for_guild(
         f"week={data.get('week')} "
         f"fallback={data.get('fallback')} "
         f"report_id={report_id or '-'} "
-        f"period={start_text}~{end_text}"
+        f"period={start_text}~{format_rotation_end_date(data['end'])}"
     )
 
     return True
