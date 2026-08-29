@@ -917,34 +917,98 @@ def is_map_service_report_article(article: dict) -> bool:
 
 
 def find_latest_map_report_url() -> str:
-    candidates = []
+    """
+    PUBG 공식 페이지에서 실제 최신 맵 서비스 리포트를 찾는다.
 
-    # ✅ 한국 페이지 우선
+    기존 문제:
+    - candidates[0]을 그대로 사용해서
+      페이지에서 먼저 발견된 오래된 리포트를 잡을 수 있었음.
+
+    개선:
+    - 맵 서비스 리포트 후보를 모두 수집
+    - 게시일 기준 최신순 정렬
+    - 가장 최근 리포트 반환
+    """
     pages = [
         "https://www.pubg.com/ko/news?category=notice",
-        "https://www.pubg.com/ko/news?category=patch_notes",
         "https://www.pubg.com/ko/news",
         "https://www.pubg.com/en/news",
     ]
 
+    candidates = []
+    seen_urls = set()
+
     for page in pages:
-        for url in collect_article_urls_from_page(page, limit=30):
+        urls = collect_article_urls_from_page(page, limit=50)
+
+        print(
+            f"[INFO] map report scan "
+            f"page={page} url_count={len(urls)}"
+        )
+
+        for url in urls:
+            if url in seen_urls:
+                continue
+
+            seen_urls.add(url)
+
             try:
                 article = parse_article(url)
-            except Exception:
-                article = None
+            except Exception as e:
+                print(
+                    f"[WARN] map report article parse failed "
+                    f"url={url} err={type(e).__name__}: {e}"
+                )
+                continue
 
             if not article:
                 continue
 
-            title = article.get("title", "")
-            title_l = title.lower()
+            if not is_map_service_report_article(article):
+                continue
 
-            if "map service report" in title_l or "맵 서비스 리포트" in title:
-                candidates.append(url)
+            article_date = _parse_post_date_to_date(
+                article.get("date")
+            )
+
+            candidates.append({
+                "url": url,
+                "date": article_date,
+                "title": article.get("title") or "",
+            })
+
+            print(
+                f"[INFO] map report candidate "
+                f"date={article_date} "
+                f"title={article.get('title')} "
+                f"url={url}"
+            )
 
     if candidates:
-        return candidates[0]
+        # 날짜가 없는 후보는 가장 뒤로 보낸다.
+        candidates.sort(
+            key=lambda x: (
+                x["date"] is not None,
+                x["date"] or datetime.min.date(),
+            ),
+            reverse=True,
+        )
+
+        selected = candidates[0]
+
+        print(
+            f"[INFO] latest map report selected "
+            f"date={selected['date']} "
+            f"title={selected['title']} "
+            f"url={selected['url']}"
+        )
+
+        return selected["url"]
+
+    print(
+        "[WARN] latest map service report not found. "
+        f"fallback_url={PUBG_MAP_REPORT_FALLBACK_URL}"
+    )
 
     return PUBG_MAP_REPORT_FALLBACK_URL
 
@@ -1313,7 +1377,27 @@ def embed_footer() -> dict:
     }
 
 
-def discord_post(webhook_url: str, content: str = "", embed: dict | None = None):
+def discord_post(
+    webhook_url: str,
+    content: str = "",
+    embed: dict | None = None
+) -> bool:
+    """
+    Discord Webhook 전송.
+
+    return:
+    - True  = 전송 성공
+    - False = 웹훅 삭제/만료 등으로 전송 실패
+
+    특정 서버의 죽은 웹훅 때문에
+    전체 GitHub Actions가 종료되지 않도록 한다.
+    """
+    webhook_url = str(webhook_url or "").strip()
+
+    if not webhook_url:
+        print("[ERROR] Discord webhook URL is empty")
+        return False
+
     payload = {
         "username": "PUBG 알림",
         "avatar_url": PUBG_ALERT_AVATAR_URL,
@@ -1328,12 +1412,44 @@ def discord_post(webhook_url: str, content: str = "", embed: dict | None = None)
     else:
         payload["content"] = content or ""
 
-    r = requests.post(
-        webhook_url,
-        json=payload,
-        timeout=20,
-    )
-    r.raise_for_status()
+    try:
+        r = requests.post(
+            webhook_url,
+            json=payload,
+            timeout=20,
+        )
+
+        if 200 <= r.status_code < 300:
+            return True
+
+        if r.status_code == 404:
+            print(
+                "[ERROR] Discord webhook not found (404). "
+                "웹훅이 삭제되었거나 URL이 변경되었습니다."
+            )
+            return False
+
+        if r.status_code == 401:
+            print(
+                "[ERROR] Discord webhook unauthorized (401). "
+                "웹훅 URL을 다시 확인하세요."
+            )
+            return False
+
+        print(
+            f"[ERROR] Discord webhook failed "
+            f"status={r.status_code} "
+            f"body={trim_text(r.text, 300)}"
+        )
+
+        return False
+
+    except requests.RequestException as e:
+        print(
+            f"[ERROR] Discord webhook request failed "
+            f"err={type(e).__name__}: {e}"
+        )
+        return False
 
 
 def should_send(state: dict, key: str) -> bool:
