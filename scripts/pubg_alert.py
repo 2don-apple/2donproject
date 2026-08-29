@@ -918,74 +918,74 @@ def is_map_service_report_article(article: dict) -> bool:
 
 def find_latest_map_report_url() -> str:
     """
-    PUBG 공식 페이지에서 실제 최신 맵 서비스 리포트를 찾는다.
+    PUBG 공식 페이지에서 최신 맵 서비스 리포트를 찾는다.
 
-    기존 문제:
-    - candidates[0]을 그대로 사용해서
-      페이지에서 먼저 발견된 오래된 리포트를 잡을 수 있었음.
+    우선순위:
+    1) 한국 공식 페이지에서 최신 맵 서비스 리포트 검색
+    2) 한국 페이지에서 하나도 찾지 못했을 때만 영문 페이지 검색
+    3) 둘 다 실패하면 고정 fallback URL 사용
 
-    개선:
-    - 맵 서비스 리포트 후보를 모두 수집
-    - 게시일 기준 최신순 정렬
-    - 가장 최근 리포트 반환
+    중요:
+    - 한국/영문 후보를 섞어서 날짜순 정렬하지 않는다.
+    - 한국 리포트가 존재하면 무조건 한국 리포트를 사용한다.
     """
-    pages = [
-        "https://www.pubg.com/ko/news?category=notice",
-        "https://www.pubg.com/ko/news",
-        "https://www.pubg.com/en/news",
-    ]
 
-    candidates = []
-    seen_urls = set()
+    def collect_map_reports(pages: list[str], source_name: str) -> list[dict]:
+        candidates = []
+        seen_urls = set()
 
-    for page in pages:
-        urls = collect_article_urls_from_page(page, limit=50)
-
-        print(
-            f"[INFO] map report scan "
-            f"page={page} url_count={len(urls)}"
-        )
-
-        for url in urls:
-            if url in seen_urls:
-                continue
-
-            seen_urls.add(url)
-
-            try:
-                article = parse_article(url)
-            except Exception as e:
-                print(
-                    f"[WARN] map report article parse failed "
-                    f"url={url} err={type(e).__name__}: {e}"
-                )
-                continue
-
-            if not article:
-                continue
-
-            if not is_map_service_report_article(article):
-                continue
-
-            article_date = _parse_post_date_to_date(
-                article.get("date")
-            )
-
-            candidates.append({
-                "url": url,
-                "date": article_date,
-                "title": article.get("title") or "",
-            })
+        for page in pages:
+            urls = collect_article_urls_from_page(page, limit=50)
 
             print(
-                f"[INFO] map report candidate "
-                f"date={article_date} "
-                f"title={article.get('title')} "
-                f"url={url}"
+                f"[INFO] map report scan "
+                f"source={source_name} "
+                f"page={page} "
+                f"url_count={len(urls)}"
             )
 
-    if candidates:
-        # 날짜가 없는 후보는 가장 뒤로 보낸다.
+            for url in urls:
+                if url in seen_urls:
+                    continue
+
+                seen_urls.add(url)
+
+                try:
+                    article = parse_article(url)
+                except Exception as e:
+                    print(
+                        f"[WARN] map report article parse failed "
+                        f"source={source_name} "
+                        f"url={url} "
+                        f"err={type(e).__name__}: {e}"
+                    )
+                    continue
+
+                if not article:
+                    continue
+
+                if not is_map_service_report_article(article):
+                    continue
+
+                article_date = _parse_post_date_to_date(
+                    article.get("date")
+                )
+
+                candidates.append({
+                    "url": url,
+                    "date": article_date,
+                    "title": article.get("title") or "",
+                    "source": source_name,
+                })
+
+                print(
+                    f"[INFO] map report candidate "
+                    f"source={source_name} "
+                    f"date={article_date} "
+                    f"title={article.get('title')} "
+                    f"url={url}"
+                )
+
         candidates.sort(
             key=lambda x: (
                 x["date"] is not None,
@@ -994,10 +994,26 @@ def find_latest_map_report_url() -> str:
             reverse=True,
         )
 
-        selected = candidates[0]
+        return candidates
+
+    # =========================
+    # 1차: 한국 페이지
+    # =========================
+    korean_pages = [
+        "https://www.pubg.com/ko/news?category=notice",
+        "https://www.pubg.com/ko/news",
+    ]
+
+    korean_candidates = collect_map_reports(
+        korean_pages,
+        "KO",
+    )
+
+    if korean_candidates:
+        selected = korean_candidates[0]
 
         print(
-            f"[INFO] latest map report selected "
+            f"[INFO] latest Korean map report selected "
             f"date={selected['date']} "
             f"title={selected['title']} "
             f"url={selected['url']}"
@@ -1005,8 +1021,40 @@ def find_latest_map_report_url() -> str:
 
         return selected["url"]
 
+    # =========================
+    # 2차: 영문 fallback
+    # =========================
     print(
-        "[WARN] latest map service report not found. "
+        "[WARN] Korean map service report not found. "
+        "fallback to English PUBG news."
+    )
+
+    english_pages = [
+        "https://www.pubg.com/en/news",
+    ]
+
+    english_candidates = collect_map_reports(
+        english_pages,
+        "EN",
+    )
+
+    if english_candidates:
+        selected = english_candidates[0]
+
+        print(
+            f"[INFO] latest English map report selected "
+            f"date={selected['date']} "
+            f"title={selected['title']} "
+            f"url={selected['url']}"
+        )
+
+        return selected["url"]
+
+    # =========================
+    # 최종 fallback
+    # =========================
+    print(
+        "[WARN] map service report not found in KO/EN pages. "
         f"fallback_url={PUBG_MAP_REPORT_FALLBACK_URL}"
     )
 
@@ -1686,10 +1734,17 @@ def send_map_rotation_for_guild(
             }
         )
 
-    discord_post(
+    sent_ok = discord_post(
         guild_cfg["webhook_url"],
         embed=embed,
     )
+
+    if not sent_ok:
+        print(
+            f"[ERROR] map rotation send failed "
+            f"gid={gid} key={key}"
+        )
+        return False
 
     mark_sent(state, key)
 
@@ -1786,10 +1841,20 @@ def send_articles_for_guild(
 
         embed = build_article_embed(article, kind)
 
-        discord_post(
+        sent_ok = discord_post(
             guild_cfg["webhook_url"],
             embed=embed,
         )
+
+        if not sent_ok:
+            print(
+                f"[ERROR] article send failed "
+                f"gid={gid} "
+                f"kind={kind} "
+                f"id={article_id} "
+                f"title={article.get('title')}"
+            )
+            continue
 
         mark_article_sent(
             state,
@@ -2359,17 +2424,33 @@ def main():
 
         # 맵 로테이션 알림이 켜져 있을 때만 맵 목록 카드를 보낸다.
         if types.get("map_rotation"):
+
             if new_map_reports:
-                # 같은 실행에서 여러 목록에 중복 검출될 가능성에 대비
+                # 같은 실행에서 여러 카테고리에서
+                # 같은 맵 서비스 리포트가 잡힐 가능성 대비
                 unique_reports = []
                 seen_report_ids = set()
 
                 for article in new_map_reports:
-                    report_id = str(article.get("id") or "").strip()
-                    report_url = str(article.get("url") or "").strip()
+                    if not isinstance(article, dict):
+                        continue
+
+                    report_id = str(
+                        article.get("id") or ""
+                    ).strip()
+
+                    report_url = str(
+                        article.get("url") or ""
+                    ).strip()
+
                     dedupe_key = report_id or report_url
 
                     if not dedupe_key:
+                        print(
+                            f"[WARN] invalid map report article "
+                            f"gid={gid} "
+                            f"article={article}"
+                        )
                         continue
 
                     if dedupe_key in seen_report_ids:
@@ -2378,16 +2459,44 @@ def main():
                     seen_report_ids.add(dedupe_key)
                     unique_reports.append(article)
 
-                # 가장 먼저 발견된 최신 리포트 하나만 사용
-                send_map_rotation_for_guild(
-                    str(gid),
-                    guild_cfg,
-                    state,
-                    report_article=unique_reports[0],
-                )
+                # 정상적인 새 리포트가 있는 경우
+                if unique_reports:
+                    selected_report = unique_reports[0]
+
+                    print(
+                        f"[INFO] use newly detected map report "
+                        f"gid={gid} "
+                        f"id={selected_report.get('id')} "
+                        f"title={selected_report.get('title')} "
+                        f"url={selected_report.get('url')}"
+                    )
+
+                    send_map_rotation_for_guild(
+                        str(gid),
+                        guild_cfg,
+                        state,
+                        report_article=selected_report,
+                    )
+
+                else:
+                    # new_map_reports는 있었지만
+                    # 유효한 id/url이 하나도 없는 비정상 상황
+                    print(
+                        f"[WARN] map report detected but "
+                        f"no valid report id/url found "
+                        f"gid={gid}. "
+                        f"fallback to latest map report search."
+                    )
+
+                    send_map_rotation_for_guild(
+                        str(gid),
+                        guild_cfg,
+                        state,
+                    )
 
             else:
-                # 새 리포트가 없는 날에도 현재 주차 카드가 누락되었으면 발송
+                # 새 리포트가 없는 날에도
+                # 해당 주차의 맵 카드가 아직 발송되지 않았다면 전송
                 send_map_rotation_for_guild(
                     str(gid),
                     guild_cfg,
